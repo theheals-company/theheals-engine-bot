@@ -56,7 +56,7 @@ def call_model(model_spec: str, system: str, user_msg: str, max_tokens: int = 20
         from openai import OpenAI
         client = OpenAI(api_key=OPENAI_API_KEY)
         resp = client.chat.completions.create(
-            model=model_name, max_tokens=max_tokens,
+            model=model_name, max_completion_tokens=max_tokens,
             messages=[{"role": "system", "content": system},
                       {"role": "user", "content": user_msg}],
         )
