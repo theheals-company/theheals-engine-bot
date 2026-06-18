@@ -1,15 +1,18 @@
 """
-더힐즈 엔진 봇 v0.5 (반자동 메모리 학습)
-- v0.4 + 메모리 학습: 작업 패턴을 감지해 스킬 승격을 '제안'(자동 승격 아님).
-- 맥락 오염 차단: 대표 승인(버튼)을 통과한 학습만 확정.
-- 멀티 프로바이더·승인 게이트·카파시 4원칙·국면 모드 모두 유지.
-- 한계: 패턴 카운트는 세션 메모리(봇 재시작 시 리셋). 영구화는 다음 단계(GitHub 연동).
+더힐즈 엔진 봇 v0.6 (자동 브리핑)
+- v0.5 + 매일 KST 07:00 자동 브리핑: AI/XR/에듀테크 동향 + 개발자 신기술을
+  #일일브리핑 채널에 자동 게시.
+- 멀티 프로바이더·메모리 학습·승인 게이트·카파시 4원칙·국면 모드 모두 유지.
+- 브리핑 내용은 현재 AI 동향 요약 수준(실시간 웹검색은 다음 단계).
+- #발주에 "브리핑"이라 치면 즉시 1회 실행(테스트용).
 """
 import os
 import datetime
 import re
 from collections import defaultdict
+from zoneinfo import ZoneInfo
 import discord
+from discord.ext import tasks
 import anthropic
 
 DISCORD_TOKEN = os.environ["DISCORD_TOKEN"]
@@ -18,6 +21,9 @@ OPENAI_API_KEY = os.environ.get("OPENAI_API_KEY", "")
 GEMINI_API_KEY = os.environ.get("GEMINI_API_KEY", "")
 ORDER_CHANNEL = os.environ.get("ORDER_CHANNEL", "발주")
 APPROVAL_CHANNEL = os.environ.get("APPROVAL_CHANNEL", "승인대기")
+BRIEFING_CHANNEL = os.environ.get("BRIEFING_CHANNEL", "일일브리핑")
+KST = ZoneInfo("Asia/Seoul")
+BRIEFING_HOUR = int(os.environ.get("BRIEFING_HOUR", "7"))  # KST 기준 시각
 
 MODEL_DESIGN  = os.environ.get("MODEL_DESIGN",  "claude:claude-opus-4-8")
 MODEL_REVIEW  = os.environ.get("MODEL_REVIEW",  "openai:gpt-5.5")
@@ -139,9 +145,43 @@ class PromoteView(discord.ui.View):
         await i.response.edit_message(content=f"❌ '{self.task_type}' 승격 보류됨", view=self)
 
 
+# ── 일일 브리핑 생성 ──
+BRIEFING_PROMPT = """오늘의 '더힐즈 엔진 AI 개발자 모드' 브리핑을 작성하라.
+대상: 뷰티/헤어 XR 에듀테크 스타트업 대표.
+다음 4개 섹션으로 각 2~3줄, 한국어로 간결하게:
+1. 🤖 AI/LLM 신기술 — 주목할 모델·기법·에이전트 동향
+2. 🥽 XR/하드웨어 — VR/AR 헤드셋, 공간컴퓨팅 동향
+3. 🛠️ 개발자 도구 — Claude Code·코딩 에이전트·생산성 도구
+4. 💡 우리 엔진 적용 포인트 — 위 중 더힐즈 엔진에 접목할 1가지 제안
+※ 실시간 최신 뉴스가 아닌 일반 동향 요약임을 맨 끝에 한 줄로 명시."""
+
+
+async def generate_briefing():
+    try:
+        text, _ = call_model(MODEL_DESIGN, SYSTEM_PROMPT, BRIEFING_PROMPT, 1500)
+    except Exception as e:
+        text = f"⚠️ 브리핑 생성 오류: {e}"
+    today = datetime.datetime.now(KST).strftime("%Y-%m-%d (%a)")
+    return f"📢 **더힐즈 엔진 일일 브리핑 — {today}**\n\n{text}"
+
+
+@tasks.loop(time=datetime.time(hour=BRIEFING_HOUR, minute=0, tzinfo=KST))
+async def daily_briefing():
+    """매일 KST 지정 시각에 #일일브리핑에 자동 게시."""
+    for guild in bot.guilds:
+        ch = discord.utils.get(guild.text_channels, name=BRIEFING_CHANNEL)
+        if ch:
+            content = await generate_briefing()
+            for idx in range(0, len(content), 1900):
+                await ch.send(content[idx:idx + 1900])
+
+
 @bot.event
 async def on_ready():
-    print(f"[더힐즈 엔진 봇 v0.5 메모리학습] 로그인: {bot.user}")
+    print(f"[더힐즈 엔진 봇 v0.6 자동브리핑] 로그인: {bot.user}")
+    if not daily_briefing.is_running():
+        daily_briefing.start()
+        print(f"[브리핑] 매일 KST {BRIEFING_HOUR:02d}:00 자동 게시 예약됨")
 
 
 @bot.event
@@ -149,6 +189,18 @@ async def on_message(message):
     if message.author == bot.user:
         return
     if message.channel.name != ORDER_CHANNEL:
+        return
+
+    # 수동 브리핑 트리거 (테스트용): "브리핑"이라고만 치면 즉시 1회 실행
+    if message.content.strip() in ("브리핑", "briefing", "브리핑해줘"):
+        async with message.channel.typing():
+            content = await generate_briefing()
+        ch = discord.utils.get(message.guild.text_channels, name=BRIEFING_CHANNEL)
+        target = ch if ch else message.channel
+        for idx in range(0, len(content), 1900):
+            await target.send(content[idx:idx + 1900])
+        if ch:
+            await message.channel.send(f"✅ 브리핑을 #{BRIEFING_CHANNEL}에 게시했습니다.")
         return
 
     task_type = classify_task(message.content)
