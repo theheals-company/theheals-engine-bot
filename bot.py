@@ -182,17 +182,29 @@ async def on_message(message):
             # 판단 근거: 반복된 실제 작업 목록
             recent = pattern_examples[task_type][-PROMOTE_THRESHOLD:]
             examples_txt = "\n".join(f"   {n}. {e}" for n, e in enumerate(recent, 1))
+            # 지아의 분석: 이 패턴이 스킬로 만들 가치가 있는지 봇이 판단
+            analyze_prompt = (
+                f"'{task_type}' 유형 작업이 {pattern_counts[task_type]}회 반복됐다. "
+                f"아래 실제 발주들을 분석해, 재사용 스킬로 승격할 가치가 있는지 판단하라.\n\n"
+                f"발주들:\n{examples_txt}\n\n"
+                f"다음 형식으로 4줄 이내로만 답하라(군더더기 금지):\n"
+                f"공통점: (세 작업의 공통 패턴 한 줄)\n"
+                f"스킬가치: 높음/중간/낮음 (한 줄 근거)\n"
+                f"추천: ✅승격 권장 또는 ❌보류 권장 (한 줄 이유)"
+            )
+            try:
+                analysis, _ = call_model(MODEL_DESIGN, SYSTEM_PROMPT, analyze_prompt, 500)
+            except Exception as e:
+                analysis = f"(분석 생성 오류: {e})"
             await approval_ch.send(
                 content=(
                     f"🧠 **메모리 학습 — 패턴 감지**\n"
                     f"'{task_type}' 유형 작업이 **{pattern_counts[task_type]}회** 반복되었습니다.\n\n"
                     f"📊 **반복된 작업들:**\n{examples_txt}\n\n"
-                    f"💡 **승격하면:** 다음 '{task_type}' 작업부터 이 스킬을 자동 참조 → "
-                    f"일관성·속도 향상, 매번 처음부터 안 해도 됨\n"
-                    f"⚠️ **보류하면:** 학습이 누적되지 않고 매번 새로 처리\n"
+                    f"🔍 **지아의 분석:**\n{analysis}\n\n"
                     f"🛡️ 승인하셔도 자동 저장이 아니라 **초안만 생성**됩니다 "
                     f"(검토 후 직접 20_SKILLS에 저장 — 맥락 오염 차단)\n\n"
-                    f"→ 재사용 스킬로 승격할까요?"
+                    f"→ 위 분석을 참고해 결정하세요."
                 ),
                 view=PromoteView(task_type))
 
