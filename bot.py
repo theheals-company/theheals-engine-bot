@@ -1,11 +1,10 @@
 """
-더힐즈 엔진 봇 v0.7 (진화 브리핑 — Gemini 검색 + 지아 심화분석)
-- v0.6 + 진화학습 독트린 적용: 매일 KST 07:00 진화 브리핑.
-  1단계 Gemini(웹검색 Grounding)로 오늘 동향 포착
-  2단계 Claude가 더힐즈 맥락(특허·경쟁사·핵심난제)으로 접목·방어·씨앗 분석
-- "정보 나열"이 아니라 "그래서 우리가 무엇을"까지 가는 의사결정 보조 브리핑.
-- 멀티 프로바이더·메모리 학습·승인 게이트 모두 유지.
-- 진화창고 자동저장(길B)은 다음 단계. 현재는 대표 선별 → 지아 가공 반자동.
+더힐즈 엔진 봇 v0.8 (검색 효율화 — 감시초소 + Gemini 3.1)
+- v0.7 + 검색 효율화: 넓은 웹 스캔 → 감시 키워드 4묶음으로 압축("감시초소").
+- 검색 모델 상향: gemini-3.1-pro-preview (완성도 우선, 멀티모달 강화).
+  접근 불가 시 gemini-2.5-pro 자동 폴백.
+- ★ 유튜브 개발자·기술 영상 동향도 검색 범위에 포함.
+- 진화 브리핑(포착·접목·방어·씨앗)·멀티프로바이더·메모리학습 모두 유지.
 """
 import os
 import datetime
@@ -28,7 +27,8 @@ BRIEFING_HOUR = int(os.environ.get("BRIEFING_HOUR", "7"))  # KST 기준 시각
 
 MODEL_DESIGN  = os.environ.get("MODEL_DESIGN",  "claude:claude-opus-4-8")
 MODEL_REVIEW  = os.environ.get("MODEL_REVIEW",  "openai:gpt-5.5")
-MODEL_RESEARCH = os.environ.get("MODEL_RESEARCH", "gemini:gemini-2.5-pro")
+MODEL_RESEARCH = os.environ.get("MODEL_RESEARCH", "gemini:gemini-3.1-pro-preview")
+MODEL_RESEARCH_FALLBACK = os.environ.get("MODEL_RESEARCH_FALLBACK", "gemini:gemini-2.5-pro")
 
 # 패턴 승격 임계값 (자료 ⑬: 3개 이상이면 스킬 후보)
 PROMOTE_THRESHOLD = int(os.environ.get("PROMOTE_THRESHOLD", "3"))
@@ -148,24 +148,42 @@ class PromoteView(discord.ui.View):
 
 # ── 일일 브리핑 생성 ──
 # ── 1단계: Gemini 웹검색(Grounding)으로 오늘 동향 포착 ──
-SEARCH_PROMPT = """오늘 기준 최신 AI/LLM, XR/공간컴퓨팅, 개발자도구, 뷰티·웰니스 테크
-분야의 주목할 뉴스·발표·동향을 검색해 5~7건 정리하라.
-각 건: [분야] 제목 — 핵심 한 줄. 한국어. 가능한 한 실제 최신 정보 위주."""
+SEARCH_PROMPT = """더힐즈(XR 실기교육 플랫폼) 감시 키워드로 오늘 최신 동향을 검색하라.
+[감시 키워드 — 이 범위만, 넓게 훑지 말 것]
+1. XR 핸드/모션 트래킹, 공간컴퓨팅 (Vision Pro·Quest·XREAL·Android XR 등)
+2. 헤어테크 / 뷰티 AI / 가상 코칭·아바타
+3. 경쟁사 동향: Milbon, Panasonic 뷰티
+4. AI 에이전트 / 코딩 도구 (Claude Code·MCP 등)
+
+뉴스/발표뿐 아니라 ★유튜브 개발자·기술 영상 동향★도 포함해 검색하라.
+각 건: [분야] 제목 — 핵심 한 줄 (+유튜브면 영상 표시). 한국어. 실제 최신 정보 위주.
+총 5~7건으로 압축."""
 
 
-def gemini_search(query):
-    """Gemini + Google Search Grounding으로 실시간 동향 검색. 실패 시 예외."""
+def _gemini_call(model_name, query):
+    """단일 Gemini 모델 호출. Grounding 우선, 미지원 시 일반 호출."""
     import google.generativeai as genai
     genai.configure(api_key=GEMINI_API_KEY)
-    provider, model_name = MODEL_RESEARCH.split(":", 1)
-    # Grounding(google search) 도구 활성화 시도
     try:
         m = genai.GenerativeModel(model_name, tools="google_search_retrieval")
         return m.generate_content(query).text
     except Exception:
-        # Grounding 미지원 시 일반 호출로 폴백
         m = genai.GenerativeModel(model_name)
         return m.generate_content(query).text
+
+
+def gemini_search(query):
+    """검색 모델(3.1) 우선, 실패 시 폴백 모델(2.5)로 자동 전환."""
+    _, primary = MODEL_RESEARCH.split(":", 1)
+    _, fallback = MODEL_RESEARCH_FALLBACK.split(":", 1)
+    try:
+        return _gemini_call(primary, query)
+    except Exception as e1:
+        # 3.1 접근 불가/오류 → 2.5로 폴백
+        try:
+            return _gemini_call(fallback, query) + f"\n(※ {primary} 사용불가로 {fallback} 폴백)"
+        except Exception as e2:
+            raise Exception(f"검색 실패: 주모델={e1}, 폴백={e2}")
 
 
 # ── 2단계: Claude가 우리 맥락(심화)으로 접목·방어·씨앗 분석 ──
@@ -224,7 +242,7 @@ async def daily_briefing():
 
 @bot.event
 async def on_ready():
-    print(f"[더힐즈 엔진 봇 v0.7 진화브리핑] 로그인: {bot.user}")
+    print(f"[더힐즈 엔진 봇 v0.8 검색효율화] 로그인: {bot.user}")
     if not daily_briefing.is_running():
         daily_briefing.start()
         print(f"[브리핑] 매일 KST {BRIEFING_HOUR:02d}:00 자동 게시 예약됨")
