@@ -1,10 +1,11 @@
 """
-더힐즈 엔진 봇 v0.6 (자동 브리핑)
-- v0.5 + 매일 KST 07:00 자동 브리핑: AI/XR/에듀테크 동향 + 개발자 신기술을
-  #일일브리핑 채널에 자동 게시.
-- 멀티 프로바이더·메모리 학습·승인 게이트·카파시 4원칙·국면 모드 모두 유지.
-- 브리핑 내용은 현재 AI 동향 요약 수준(실시간 웹검색은 다음 단계).
-- #발주에 "브리핑"이라 치면 즉시 1회 실행(테스트용).
+더힐즈 엔진 봇 v0.7 (진화 브리핑 — Gemini 검색 + 지아 심화분석)
+- v0.6 + 진화학습 독트린 적용: 매일 KST 07:00 진화 브리핑.
+  1단계 Gemini(웹검색 Grounding)로 오늘 동향 포착
+  2단계 Claude가 더힐즈 맥락(특허·경쟁사·핵심난제)으로 접목·방어·씨앗 분석
+- "정보 나열"이 아니라 "그래서 우리가 무엇을"까지 가는 의사결정 보조 브리핑.
+- 멀티 프로바이더·메모리 학습·승인 게이트 모두 유지.
+- 진화창고 자동저장(길B)은 다음 단계. 현재는 대표 선별 → 지아 가공 반자동.
 """
 import os
 import datetime
@@ -146,23 +147,68 @@ class PromoteView(discord.ui.View):
 
 
 # ── 일일 브리핑 생성 ──
-BRIEFING_PROMPT = """오늘의 '더힐즈 엔진 AI 개발자 모드' 브리핑을 작성하라.
-대상: 뷰티/헤어 XR 에듀테크 스타트업 대표.
-다음 4개 섹션으로 각 2~3줄, 한국어로 간결하게:
-1. 🤖 AI/LLM 신기술 — 주목할 모델·기법·에이전트 동향
-2. 🥽 XR/하드웨어 — VR/AR 헤드셋, 공간컴퓨팅 동향
-3. 🛠️ 개발자 도구 — Claude Code·코딩 에이전트·생산성 도구
-4. 💡 우리 엔진 적용 포인트 — 위 중 더힐즈 엔진에 접목할 1가지 제안
-※ 실시간 최신 뉴스가 아닌 일반 동향 요약임을 맨 끝에 한 줄로 명시."""
+# ── 1단계: Gemini 웹검색(Grounding)으로 오늘 동향 포착 ──
+SEARCH_PROMPT = """오늘 기준 최신 AI/LLM, XR/공간컴퓨팅, 개발자도구, 뷰티·웰니스 테크
+분야의 주목할 뉴스·발표·동향을 검색해 5~7건 정리하라.
+각 건: [분야] 제목 — 핵심 한 줄. 한국어. 가능한 한 실제 최신 정보 위주."""
+
+
+def gemini_search(query):
+    """Gemini + Google Search Grounding으로 실시간 동향 검색. 실패 시 예외."""
+    import google.generativeai as genai
+    genai.configure(api_key=GEMINI_API_KEY)
+    provider, model_name = MODEL_RESEARCH.split(":", 1)
+    # Grounding(google search) 도구 활성화 시도
+    try:
+        m = genai.GenerativeModel(model_name, tools="google_search_retrieval")
+        return m.generate_content(query).text
+    except Exception:
+        # Grounding 미지원 시 일반 호출로 폴백
+        m = genai.GenerativeModel(model_name)
+        return m.generate_content(query).text
+
+
+# ── 2단계: Claude가 우리 맥락(심화)으로 접목·방어·씨앗 분석 ──
+HEALS_CONTEXT = """[더힐즈 핵심 맥락 — 분석 기준]
+- 사업: XR 실기교육 플랫폼. 공통기술(2D→3D 변형·코칭아바타·데이터가공·UIUX) 위에
+  헤어XR / 웰니스 두 콘텐츠. "함께 개발" 플랫폼 전략.
+- 핵심 난제: Virtual Tension(손가락 관절각도로 모발장력 추론), 마스터 모션데이터 확보.
+- 특허(PCT): 0092WO 햅틱-다이나믹 루프, 0095WO 이종센서 AI학습·데이터매칭.
+- 경쟁: Milbon(미 상표 선점), Panasonic. 일일 모니터링 대상.
+- 로드맵: Phase1 BYOD(스마트폰+TV) → XR → 로보틱스."""
+
+ANALYSIS_PROMPT_TMPL = """아래는 Gemini가 검색한 오늘의 기술 동향이다.
+{context}
+
+[동향 원문]
+{trends}
+
+위 동향을 더힐즈 관점에서 분석하라. 진화학습 독트린의 4단계를 따른다.
+한국어로, 정보 나열이 아니라 "그래서 우리가 무엇을"까지 간다:
+
+🔍 **오늘의 동향** — 위 중 우리에게 의미있는 3~4건만 추려 한 줄씩
+💡 **접목 포인트** — 이 중 공통-플랫폼/헤어/웰니스에 접목 가능한 것 1~2개, 구체적으로
+🛡️ **방어 포인트** — 경쟁(Milbon 등)·리스크·특허 측면에서 주의할 신호
+💎 **씨앗(신생 아이디어)** — 이 정보가 우리에게 열어주는 새 가능성·추론 1개
+간결하게. 각 섹션 핵심만."""
 
 
 async def generate_briefing():
-    try:
-        text, _ = call_model(MODEL_DESIGN, SYSTEM_PROMPT, BRIEFING_PROMPT, 1500)
-    except Exception as e:
-        text = f"⚠️ 브리핑 생성 오류: {e}"
     today = datetime.datetime.now(KST).strftime("%Y-%m-%d (%a)")
-    return f"📢 **더힐즈 엔진 일일 브리핑 — {today}**\n\n{text}"
+    # 1단계: Gemini 검색
+    try:
+        trends = gemini_search(SEARCH_PROMPT)
+    except Exception as e:
+        trends = f"(Gemini 검색 실패: {e})"
+    # 2단계: Claude 심화 분석 (접목·방어·씨앗)
+    try:
+        analysis_prompt = ANALYSIS_PROMPT_TMPL.format(
+            context=HEALS_CONTEXT, trends=trends[:3000])
+        analysis, _ = call_model(MODEL_DESIGN, SYSTEM_PROMPT, analysis_prompt, 2000)
+    except Exception as e:
+        analysis = f"⚠️ 분석 생성 오류: {e}\n\n[검색 원문]\n{trends[:1500]}"
+    return (f"📢 **더힐즈 엔진 진화 브리핑 — {today}**\n"
+            f"_Gemini 포착 → 지아 해석 (접목·방어·씨앗)_\n\n{analysis}")
 
 
 @tasks.loop(time=datetime.time(hour=BRIEFING_HOUR, minute=0, tzinfo=KST))
@@ -178,7 +224,7 @@ async def daily_briefing():
 
 @bot.event
 async def on_ready():
-    print(f"[더힐즈 엔진 봇 v0.6 자동브리핑] 로그인: {bot.user}")
+    print(f"[더힐즈 엔진 봇 v0.7 진화브리핑] 로그인: {bot.user}")
     if not daily_briefing.is_running():
         daily_briefing.start()
         print(f"[브리핑] 매일 KST {BRIEFING_HOUR:02d}:00 자동 게시 예약됨")
