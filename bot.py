@@ -14,6 +14,7 @@ from zoneinfo import ZoneInfo
 import discord
 from discord.ext import tasks
 import anthropic
+from vault_writer import save_skill_to_vault
 
 DISCORD_TOKEN = os.environ["DISCORD_TOKEN"]
 ANTHROPIC_API_KEY = os.environ.get("ANTHROPIC_API_KEY", "")
@@ -132,13 +133,27 @@ class PromoteView(discord.ui.View):
             draft, _ = call_model(MODEL_DESIGN, SYSTEM_PROMPT, draft_prompt, 1500)
         except Exception as e:
             draft = f"⚠️ 초안 생성 오류: {e}"
+        # === 길B: 승인된 초안을 볼트에 자동 저장 (정상 초안일 때만) ===
+        save_msg = ""
+        if not draft.startswith("⚠️"):
+            try:
+                result = save_skill_to_vault(
+                    path=f"20_SKILLS/{self.task_type}-스킬.md",
+                    content=draft,
+                    message=f"길B 자동저장: {self.task_type} 스킬 승격 (대표 승인)"
+                )
+                save_msg = f"\n\n🟢 **볼트 자동저장 완료** → {result['url']}"
+            except Exception as e:
+                save_msg = f"\n\n🔴 **저장 실패** (수동 저장 필요): {e}"
+        # ============================================================
+
         await i.response.edit_message(
             content=f"✅ **스킬 승격 승인됨** — '{self.task_type}'\n\n"
                     f"**📄 스킬 초안:**\n{draft[:1400]}\n\n"
                     f"— — —\n"
                     f"💾 **저장 방법:** 위 초안을 검토 후 Claude Code(또는 옵시디언)로 "
                     f"`20_SKILLS/{self.task_type}-스킬.md`에 저장하세요. "
-                    f"헌법 제5조에 따라 INDEX·LOG 등록도 함께.", view=self)
+                    f"헌법 제5조에 따라 INDEX·LOG 등록도 함께." + save_msg, view=self)
 
     @discord.ui.button(label="무시", style=discord.ButtonStyle.secondary, emoji="❌")
     async def ignore(self, i, b):
