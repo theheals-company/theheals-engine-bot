@@ -123,6 +123,7 @@ class PromoteView(discord.ui.View):
 
     @discord.ui.button(label="스킬로 승격", style=discord.ButtonStyle.success, emoji="✅")
     async def promote(self, i, b):
+        await i.response.defer()
         for c in self.children: c.disabled = True
         examples = "\n".join(f"- {e}" for e in pattern_examples[self.task_type][:5])
         # 스킬 초안 생성 (Claude로)
@@ -147,7 +148,7 @@ class PromoteView(discord.ui.View):
                 save_msg = f"\n\n🔴 **저장 실패** (수동 저장 필요): {e}"
         # ============================================================
 
-        await i.response.edit_message(
+        await i.edit_original_response(
             content=f"✅ **스킬 승격 승인됨** — '{self.task_type}'\n\n"
                     f"**📄 스킬 초안:**\n{draft[:1400]}\n\n"
                     f"— — —\n"
