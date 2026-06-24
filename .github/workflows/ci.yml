@@ -1,0 +1,78 @@
+# .github/workflows/ci.yml
+# 더힐즈 엔진 — CI 1심 (불복 불가) · 도면 2호 로드맵 3단계
+# 대상 레포: theheals-company/theheals-engine-bot
+# 심판 구성: A. Lint(ruff) / B. Test(pytest smoke) / C. Build(byte-compile)
+# 원칙: 기계가 형식을 판정. 통과분만 ⑥승인·⑦진화로 흐른다.
+
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+
+# 최소 권한 (헌장 정합 — least privilege)
+permissions:
+  contents: read
+
+# 같은 브랜치 중복 실행 취소 (CI 분(minute) 절약 — 비용 규율)
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  PYTHON_VERSION: "3.12"   # ⚠️ 봇 실제 런타임 버전과 일치시킬 것 (확인 필요)
+
+jobs:
+  # ── 1심-A · 형식 판정 ─────────────────────────────
+  lint:
+    name: 1심-A · Lint (ruff)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: ${{ env.PYTHON_VERSION }}
+      - name: Install ruff
+        run: pip install ruff
+      - name: Ruff check (lint)
+        run: ruff check . --output-format=github
+      - name: Ruff format check
+        run: ruff format --check .
+
+  # ── 1심-B · 가드레일 스모크 ───────────────────────
+  # 핵심: 외부 네트워크(GitHub API) 호출 없이 가드레일 '로직'만 검증.
+  #       실제 테스트 본문은 Claude Code가 vault_writer.py 실물을 읽고 작성한다.
+  test:
+    name: 1심-B · Test (pytest smoke)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: ${{ env.PYTHON_VERSION }}
+          cache: pip
+      - name: Install dependencies
+        run: |
+          python -m pip install --upgrade pip
+          pip install -r requirements.txt   # ⚠️ requirements.txt 존재 확인 필요
+          pip install pytest
+      - name: Run smoke tests (no network — 가드레일 로직만)
+        run: pytest tests/ -v -m smoke
+        # 비밀키/토큰 주입 없음. 스모크 테스트는 monkeypatch로
+        # GitHub 클라이언트를 가짜 객체로 대체해 네트워크를 차단해야 한다.
+
+  # ── 1심-C · 빌드(구문) 무결성 ─────────────────────
+  # bot.py를 직접 import하면 디스코드 클라이언트가 기동되어 멈출 수 있으므로
+  # 실행이 아닌 '바이트 컴파일'로 구문 무결성만 판정한다 (부작용 없음).
+  build:
+    name: 1심-C · Build (byte-compile)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: ${{ env.PYTHON_VERSION }}
+      - name: Byte-compile (syntax sanity)
+        run: python -m compileall -q .

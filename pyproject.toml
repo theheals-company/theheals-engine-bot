@@ -1,0 +1,18 @@
+# 더힐즈 엔진 봇 — 프로젝트 설정
+# (CI 1심 로드맵 3단계: smoke 마커 등록 + ruff 최소 설정)
+
+[tool.pytest.ini_options]
+# tests/ 에서 루트의 vault_writer.py 를 import 할 수 있도록 루트를 경로에 추가
+pythonpath = ["."]
+markers = [
+    "smoke: 가드레일 스모크",
+]
+
+[tool.ruff]
+target-version = "py312"
+# 한국어 f-string을 손으로 쪼개지 않고 E501을 해소(동작 불변 원칙)
+line-length = 120
+
+[tool.ruff.lint]
+# 정식 기본 룰셋: pycodestyle(E) + pyflakes(F) + isort(I)
+select = ["E", "F", "I"]
