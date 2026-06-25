@@ -76,3 +76,21 @@ jobs:
           python-version: ${{ env.PYTHON_VERSION }}
       - name: Byte-compile (syntax sanity)
         run: python -m compileall -q .
+
+  # ── 1심-D · 볼트 방어선 (VaultLint) ───────────────
+  # 볼트 레포를 read-only로 체크아웃해 tools/vault_lint.py 실행.
+  # 이 잡이 green이면 VAULT_READ_TOKEN(최소권한 contents:read) 정상 증명.
+  vault-lint:
+    name: 1심-D · VaultLint (볼트 방어선)
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout vault (read-only)
+        uses: actions/checkout@v4
+        with:
+          repository: theheals-company/theheals-engine-vault
+          token: ${{ secrets.VAULT_READ_TOKEN }}
+      - uses: actions/setup-python@v5
+        with:
+          python-version: ${{ env.PYTHON_VERSION }}
+      - name: Run vault lint
+        run: python tools/vault_lint.py

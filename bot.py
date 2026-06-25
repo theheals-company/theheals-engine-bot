@@ -26,6 +26,7 @@ GEMINI_API_KEY = os.environ.get("GEMINI_API_KEY", "")
 ORDER_CHANNEL = os.environ.get("ORDER_CHANNEL", "발주")
 APPROVAL_CHANNEL = os.environ.get("APPROVAL_CHANNEL", "승인대기")
 BRIEFING_CHANNEL = os.environ.get("BRIEFING_CHANNEL", "일일브리핑")
+MISTAKE_CHANNEL = os.environ.get("MISTAKE_CHANNEL", "오답노트")  # AgentShield 차단 알림용
 KST = ZoneInfo("Asia/Seoul")
 BRIEFING_HOUR = int(os.environ.get("BRIEFING_HOUR", "7"))  # KST 기준 시각
 
@@ -229,6 +230,11 @@ class PromoteView(discord.ui.View):
                 save_msg = f"\n\n🟢 **볼트 자동저장 완료** → {result['url']}"
             except Exception as e:
                 save_msg = f"\n\n🔴 **저장 실패** (수동 저장 필요): {e}"
+                # AgentShield 차단이면 #오답노트에 자동 알림 (비밀값 없이 사유·파일명만)
+                if "AgentShield" in str(e):
+                    mch = discord.utils.get(i.guild.text_channels, name=MISTAKE_CHANNEL)
+                    if mch:
+                        await mch.send(f"🛡️ AgentShield 차단 — {self.task_type}: {e}")
         # ============================================================
 
         await i.edit_original_response(

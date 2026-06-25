@@ -15,6 +15,8 @@
 | ruff | unpinned (CI `pip install ruff`) · 설정 pyproject.toml: select E/F/I, line-length 120, target py312 | ci.yml:38 / pyproject.toml |
 | pytest | unpinned (CI `pip install pytest`) · 마커 `smoke`, `pythonpath=["."]` | ci.yml:60 / pyproject.toml |
 
+> 봇 `models.yaml`은 볼트 권위본(`fresh-vault/90_SCHEMA/models.yaml`)의 런타임 사본이다. 볼트 갱신 후 수동 동기화한다(자동 동기화 없음).
+
 ## 실행
 ```
 python bot.py

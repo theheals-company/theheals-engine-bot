@@ -1,4 +1,4 @@
-# AUTHORITY: fresh-vault/90_SCHEMA/models.yaml @ c2740cc
+# AUTHORITY: fresh-vault/90_SCHEMA/models.yaml @ ee9f61d
 # 이 파일은 볼트 권위본의 런타임 사본. 직접 편집 금지. 볼트 갱신 후 동기화.
 # 형식: 역할 → "provider:model" (런타임 call_model 소비형). drift는 부채로 관리(자동 동기화 안 함).
 
