@@ -16,6 +16,7 @@ import anthropic
 import discord
 from discord.ext import tasks
 
+from core import models_loader
 from vault_writer import save_skill_to_vault
 
 DISCORD_TOKEN = os.environ["DISCORD_TOKEN"]
@@ -28,10 +29,8 @@ BRIEFING_CHANNEL = os.environ.get("BRIEFING_CHANNEL", "일일브리핑")
 KST = ZoneInfo("Asia/Seoul")
 BRIEFING_HOUR = int(os.environ.get("BRIEFING_HOUR", "7"))  # KST 기준 시각
 
-MODEL_DESIGN = os.environ.get("MODEL_DESIGN", "claude:claude-opus-4-8")
-MODEL_REVIEW = os.environ.get("MODEL_REVIEW", "openai:gpt-5.5")
-MODEL_RESEARCH = os.environ.get("MODEL_RESEARCH", "gemini:gemini-3.1-pro-preview")
-MODEL_RESEARCH_FALLBACK = os.environ.get("MODEL_RESEARCH_FALLBACK", "gemini:gemini-2.5-pro")
+# 모델 배정은 models.yaml(볼트 권위본의 런타임 사본) → core.models_loader 경유. (V2.5 A-2)
+# env 하드코딩 제거. 비밀값(API 키)만 env 유지.
 
 # 패턴 승격 임계값 (자료 ⑬: 3개 이상이면 스킬 후보)
 PROMOTE_THRESHOLD = int(os.environ.get("PROMOTE_THRESHOLD", "3"))
@@ -77,10 +76,10 @@ def classify_task(user_msg: str) -> str:
 
 def pick_model(task_type: str) -> str:
     if task_type == "리서치":
-        return MODEL_RESEARCH
+        return models_loader.get_model("research")
     if task_type == "검증":
-        return MODEL_REVIEW
-    return MODEL_DESIGN
+        return models_loader.get_model("review")
+    return models_loader.get_model("design")
 
 
 def call_model(model_spec, system, user_msg, max_tokens=2048):
@@ -112,14 +111,13 @@ def call_model(model_spec, system, user_msg, max_tokens=2048):
 
 
 def pick_reviewer(builder_spec: str) -> str | None:
-    """빌더와 다른 혈통(회사)의 2심 리뷰어 모델 선택. 동일 혈통뿐이면 None."""
+    """빌더와 다른 혈통(회사)의 2심 리뷰어 모델 선택. 동일 혈통뿐이면 None.
+    모델 ID는 models_loader 경유(하드코딩 제거). 교차혈통 원칙은 유지(헌법 제4조)."""
     provider = builder_spec.split(":", 1)[0]
-    if provider == "claude":
-        return MODEL_REVIEW
+    if provider in ("claude", "gemini"):
+        return models_loader.get_reviewer()  # 기본 openai 리뷰어
     if provider == "openai":
-        return "claude:claude-opus-4-8"
-    if provider == "gemini":
-        return MODEL_REVIEW
+        return f"claude:{models_loader.get_principal()}"  # openai 빌더 → claude 리뷰어
     return None
 
 
@@ -139,6 +137,33 @@ def cross_review(draft, user_msg, builder_spec) -> str:
         return text
     except Exception as e:
         return f"⚠️ 교차 2심 실패 ({type(e).__name__})"
+
+
+# ── V2.5 A-2: 에스컬레이션 (연속 실패/특정 task_type → principal 재라우팅) ──
+_fail_streak = {}  # task_type → 연속 실패 횟수 (메모리 내)
+
+
+def _should_escalate(task_type: str) -> bool:
+    """governance.trigger_conditions 충족 여부 (연속실패 임계 또는 특정 task_type)."""
+    conds = models_loader.get_governance().get("escalate_to_principal", {}).get("trigger_conditions", [])
+    threshold = None
+    trigger_types = set()
+    for c in conds:
+        if "consecutive_failures" in c:
+            threshold = c["consecutive_failures"]
+        if "task_type" in c:
+            trigger_types.add(c["task_type"])
+    if task_type in trigger_types:
+        return True
+    return threshold is not None and _fail_streak.get(task_type, 0) >= threshold
+
+
+async def escalate_to_principal(channel, task_type: str, reason: str) -> str:
+    """principal 모델로 재라우팅 + #발주 채널 알림(비밀값 없이 모델명·사유만). 반환=provider:model."""
+    principal = models_loader.get_principal()  # claude-opus-4-8 (bare)
+    spec = f"claude:{principal}"
+    await channel.send(f"⚠️ 에스컬레이션: {reason} → principal({principal}) 재라우팅")
+    return spec
 
 
 intents = discord.Intents.default()
@@ -189,7 +214,7 @@ class PromoteView(discord.ui.View):
             f"헌법 제5조 승격 절차 준수, 간결하게.\n\n발주들:\n{examples}"
         )
         try:
-            draft, _ = call_model(MODEL_DESIGN, SYSTEM_PROMPT, draft_prompt, 1500)
+            draft, _ = call_model(models_loader.get_model("design"), SYSTEM_PROMPT, draft_prompt, 1500)
         except Exception as e:
             draft = f"⚠️ 초안 생성 오류: {e}"
         # === 길B: 승인된 초안을 볼트에 자동 저장 (정상 초안일 때만) ===
@@ -252,8 +277,8 @@ def _gemini_call(model_name, query):
 
 def gemini_search(query):
     """검색 모델(3.1) 우선, 실패 시 폴백 모델(2.5)로 자동 전환."""
-    _, primary = MODEL_RESEARCH.split(":", 1)
-    _, fallback = MODEL_RESEARCH_FALLBACK.split(":", 1)
+    _, primary = models_loader.get_model("research").split(":", 1)
+    _, fallback = models_loader.get_model("research_fallback").split(":", 1)
     try:
         return _gemini_call(primary, query)
     except Exception as e1:
@@ -299,7 +324,7 @@ async def generate_briefing():
     # 2단계: Claude 심화 분석 (접목·방어·씨앗)
     try:
         analysis_prompt = ANALYSIS_PROMPT_TMPL.format(context=HEALS_CONTEXT, trends=trends[:3000])
-        analysis, _ = call_model(MODEL_DESIGN, SYSTEM_PROMPT, analysis_prompt, 2000)
+        analysis, _ = call_model(models_loader.get_model("design"), SYSTEM_PROMPT, analysis_prompt, 2000)
     except Exception as e:
         analysis = f"⚠️ 분석 생성 오류: {e}\n\n[검색 원문]\n{trends[:1500]}"
     return f"📢 **더힐즈 엔진 진화 브리핑 — {today}**\n_Gemini 포착 → 지아 해석 (접목·방어·씨앗)_\n\n{analysis}"
@@ -349,9 +374,23 @@ async def on_message(message):
     async with message.channel.typing():
         try:
             answer, usage = call_model(model_spec, SYSTEM_PROMPT, message.content)
+            _fail_streak[task_type] = 0
             answer += f"\n\n— — —\n🤖 모델: {model_spec} | 📊 {usage} | 🏷️ 유형: {task_type}"
         except Exception as e:
-            answer = f"⚠️ 처리 오류 ({model_spec}): {e}"
+            _fail_streak[task_type] = _fail_streak.get(task_type, 0) + 1
+            if _should_escalate(task_type):
+                # 연속 실패/특정 task_type → principal로 재라우팅 후 1회 재시도
+                model_spec = await escalate_to_principal(
+                    message.channel, task_type, f"{task_type} {_fail_streak[task_type]}회 연속 실패"
+                )
+                try:
+                    answer, usage = call_model(model_spec, SYSTEM_PROMPT, message.content)
+                    _fail_streak[task_type] = 0
+                    answer += f"\n\n— — —\n🤖 모델(승계): {model_spec} | 📊 {usage} | 🏷️ 유형: {task_type}"
+                except Exception as e2:
+                    answer = f"⚠️ 처리 오류 (escalated {model_spec}): {e2}"
+            else:
+                answer = f"⚠️ 처리 오류 ({model_spec}): {e}"
 
     for idx in range(0, len(answer), 1900):
         await message.channel.send(answer[idx : idx + 1900])
@@ -396,7 +435,7 @@ async def on_message(message):
                 f"추천: ✅승격 권장 또는 ❌보류 권장 (한 줄 이유)"
             )
             try:
-                analysis, _ = call_model(MODEL_DESIGN, SYSTEM_PROMPT, analyze_prompt, 500)
+                analysis, _ = call_model(models_loader.get_model("design"), SYSTEM_PROMPT, analyze_prompt, 500)
             except Exception as e:
                 analysis = f"(분석 생성 오류: {e})"
             await approval_ch.send(

@@ -1,0 +1,21 @@
+# AUTHORITY: fresh-vault/90_SCHEMA/models.yaml @ c2740cc
+# 이 파일은 볼트 권위본의 런타임 사본. 직접 편집 금지. 볼트 갱신 후 동기화.
+# 형식: 역할 → "provider:model" (런타임 call_model 소비형). drift는 부채로 관리(자동 동기화 안 함).
+
+models:
+  design: "claude:claude-opus-4-8"            # 볼트 CREATE.designer/architect
+  review: "openai:gpt-5.5"                    # 볼트 CREATE.critic_cross / governance.pick_reviewer
+  research: "gemini:gemini-3.1-pro-preview"   # 봇 현행 유지(behavior 불변). ⚠️ DRIFT: 볼트=gemini-3.1-pro → 부채
+  research_fallback: "gemini:gemini-2.5-pro"  # ⚠️ DRIFT: 볼트 미정의 → 봇 현행값. 볼트에 추가 필요(부채)
+
+governance:
+  escalate_to_principal:
+    trigger_conditions:
+      - consecutive_failures: 2
+      - task_type: "new_architecture"
+      - task_type: "quarterly_distill"
+    principal_model: "claude-opus-4-8"
+    fallback_model: "claude-sonnet-4-6"
+  pick_reviewer:
+    default: "openai"      # 교차 혈통 원칙 (다른 회사)
+    model: "gpt-5.5"
