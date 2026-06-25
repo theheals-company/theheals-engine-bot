@@ -44,6 +44,14 @@ SYSTEM_PROMPT = """당신은 더힐즈컴퍼니(The Heals Company)의 더힐즈 
 [태도] 무의미한 위로 배제. 린 제안. 진짜 목적 추론 + 대안 선제.
 [비용] 완성도 우선이되 출력은 핵심 중심. 실제 실행 전 대표 승인."""
 
+# ── 4-A: 교차혈통 2심 리뷰어 시스템 프롬프트 ──
+SYSTEM_CROSS = """너는 교차혈통 2심 리뷰어다. 빌더와 다른 회사 모델로서, 원발주 대비
+드래프트의 누락·오류·과장을 비평한다. 출력은 반드시:
+판정: 승인의견|보완필요|반려의견
+• 핵심지적(최대3): ...
+• 수정제안(선택): ...
+너는 최종 판정자가 아니다. 최종 결정은 대표가 한다."""
+
 # ── 세션 메모리: 작업 유형별 카운트 + 발주 기록 ──
 pattern_counts = defaultdict(int)
 pattern_examples = defaultdict(list)
@@ -101,6 +109,36 @@ def call_model(model_spec, system, user_msg, max_tokens=2048):
         m = genai.GenerativeModel(model_name, system_instruction=system)
         return m.generate_content(user_msg).text, "토큰 정보 없음"
     return f"⚠️ 알 수 없는 프로바이더: {provider}", "—"
+
+
+def pick_reviewer(builder_spec: str) -> str | None:
+    """빌더와 다른 혈통(회사)의 2심 리뷰어 모델 선택. 동일 혈통뿐이면 None."""
+    provider = builder_spec.split(":", 1)[0]
+    if provider == "claude":
+        return MODEL_REVIEW
+    if provider == "openai":
+        return "claude:claude-opus-4-8"
+    if provider == "gemini":
+        return MODEL_REVIEW
+    return None
+
+
+def cross_review(draft, user_msg, builder_spec) -> str:
+    """교차혈통 2심. fail-open: 동일혈통이면 생략, 실패해도 게이트를 막지 않음."""
+    reviewer = pick_reviewer(builder_spec)
+    if reviewer is None:
+        return "⚠️ 교차 2심 생략 (동일 혈통)"
+    try:
+        # call_model은 (텍스트, 사용량) 튜플을 반환 → 텍스트만 사용
+        text, _ = call_model(
+            reviewer,
+            SYSTEM_CROSS,
+            f"[원발주]\n{user_msg}\n\n[드래프트]\n{draft}",
+            max_tokens=700,
+        )
+        return text
+    except Exception as e:
+        return f"⚠️ 교차 2심 실패 ({type(e).__name__})"
 
 
 intents = discord.Intents.default()
@@ -325,9 +363,19 @@ async def on_message(message):
 
     approval_ch = discord.utils.get(message.guild.text_channels, name=APPROVAL_CHANNEL)
     if approval_ch:
-        # 일반 승인 게이트
+        # 4-A 교차혈통 2심 (draft=answer, 원발주=message.content) — fail-open, 게이트 차단 안 함
+        review = cross_review(answer, message.content, model_spec)
+        reviewer_label = pick_reviewer(model_spec) or "동일 혈통"
+        draft_txt = answer if len(answer) <= 1200 else answer[:1200] + "…(생략)"
+        review_txt = review if len(review) <= 600 else review[:600] + "…(생략)"
+        # 일반 승인 게이트 (교차 2심 결과 병기)
         await approval_ch.send(
-            content=f'📋 **승인 대기** — "{message.content[:150]}"\n🤖 {model_spec}\n\n{answer[:1200]}',
+            content=(
+                f"📋 **승인 대기**\n{draft_txt}\n"
+                f"───────────────\n"
+                f"🔍 **교차 2심** ({reviewer_label})\n{review_txt}\n"
+                f"───────────────"
+            ),
             view=ApprovalView(),
         )
 
