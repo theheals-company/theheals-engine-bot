@@ -1,11 +1,15 @@
 # vault_writer.py — 길 B 영구기억: 봇 → GitHub 볼트 저장 (20_SKILLS 전용)
 import base64
+import datetime
+import logging
 import os
 import re
 
 import requests
 
-ALLOWED_PREFIX = "20_SKILLS/"  # 가드레일1: 이 경로만 쓰기 허용
+logger = logging.getLogger(__name__)
+
+ALLOWED_PREFIX = ("20_SKILLS/", "10_WIKI/오답노트/")  # 가드레일1: 허용 경로 목록
 SECRET_PATTERNS = [  # 가드레일3: 비밀키 평문 차단
     r"github_pat_\w+",
     r"ghp_\w+",
@@ -71,6 +75,23 @@ def save_skill_to_vault(path: str, content: str, message: str) -> dict:
     if sha:
         body["sha"] = sha
 
+    # S2 인라인 가드: sensitivity:S2 감지 시 PUT 차단
+    if "sensitivity: s2" in content.lower():
+        logger.warning("S2 content blocked: %s", path)
+        return {"ok": False, "reason": "S2_BLOCKED", "path": path}
+
     resp = requests.put(url, headers=headers, json=body, timeout=15)
     resp.raise_for_status()
     return {"ok": True, "path": path, "url": resp.json()["content"]["html_url"]}
+
+
+def build_mistake_note(task: str, cause: str, fix: str) -> str:
+    today = datetime.date.today().isoformat()
+    return (
+        f"---\nsensitivity: S0\ndate: {today}\n---\n"
+        f"# 오답노트: {task}\n"
+        f"- 날짜: {today}\n"
+        f"- 작업: {task}\n"
+        f"- 원인: {cause}\n"
+        f"- 방지책: {fix}\n"
+    )
