@@ -1,6 +1,7 @@
 # vault_writer.py — 길 B 영구기억: 봇 → GitHub 볼트 저장 (20_SKILLS 전용)
 import base64
 import datetime
+import json
 import logging
 import os
 import re
@@ -10,6 +11,8 @@ import requests
 logger = logging.getLogger(__name__)
 
 ALLOWED_PREFIX = ("20_SKILLS/", "10_WIKI/오답노트/")  # 가드레일1: 허용 경로 목록
+FAIL_THRESHOLD = 2  # 실패 누적 임계값 (성공쪽 PROMOTE_THRESHOLD=3과 별도)
+_fail_counts: dict = {}  # 메모리 내 실패 카운터 (프로세스 재시작 시 초기화)
 SECRET_PATTERNS = [  # 가드레일3: 비밀키 평문 차단
     r"github_pat_\w+",
     r"ghp_\w+",
@@ -123,4 +126,30 @@ def build_mistake_note(task: str, cause: str, fix: str) -> str:
         f"- 작업: {task}\n"
         f"- 원인: {cause}\n"
         f"- 방지책: {fix}\n"
+    )
+
+
+def record_fail_pattern(task_type: str) -> dict:
+    """실패 유형별 누적 카운터. 반환: {"task_type", "count", "threshold_reached"}"""
+    _fail_counts[task_type] = _fail_counts.get(task_type, 0) + 1
+    count = _fail_counts[task_type]
+    try:
+        save_skill_to_vault(
+            path="10_WIKI/오답노트/_fail_counts.json",
+            content=json.dumps(_fail_counts, ensure_ascii=False, indent=2),
+            message=f"실패 카운터 업데이트: {task_type}={count}",
+        )
+    except Exception:
+        pass  # 저장 실패는 무시 — 카운터는 메모리에 유지
+    return {"task_type": task_type, "count": count, "threshold_reached": count >= FAIL_THRESHOLD}
+
+
+def promote_fail_pattern(task_type: str, fix_content: str) -> dict:
+    """실패패턴 방지책을 20_SKILLS/ 스킬 초안으로 저장."""
+    skill_content = f"---\nsensitivity: S0\n---\n# {task_type} — 반복 실패 방지 스킬\n\n## 방지책\n{fix_content}\n"
+    path = f"20_SKILLS/{slugify(task_type)}-방지책-스킬.md"
+    return save_skill_to_vault(
+        path=path,
+        content=skill_content,
+        message=f"실패패턴 스킬 승격: {task_type}",
     )
