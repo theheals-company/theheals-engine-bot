@@ -17,7 +17,7 @@ import discord
 from discord.ext import tasks
 
 from core import models_loader
-from vault_writer import save_skill_to_vault
+from vault_writer import process_cancel_note, save_skill_to_vault
 
 DISCORD_TOKEN = os.environ["DISCORD_TOKEN"]
 ANTHROPIC_API_KEY = os.environ.get("ANTHROPIC_API_KEY", "")
@@ -172,9 +172,40 @@ intents.message_content = True
 bot = discord.Client(intents=intents)
 
 
+class CancelModal(discord.ui.Modal, title="취소 사유 입력"):
+    cause_input = discord.ui.TextInput(
+        label="원인",
+        placeholder="이 작업이 왜 반려됐는지",
+        required=False,
+        style=discord.TextStyle.paragraph,
+    )
+    fix_input = discord.ui.TextInput(
+        label="방지책",
+        placeholder="다음에 어떻게 막을지",
+        required=False,
+        style=discord.TextStyle.paragraph,
+    )
+
+    def __init__(self, task_name: str, view: "ApprovalView"):
+        super().__init__()
+        self.task_name = task_name
+        self.approval_view = view
+
+    async def on_submit(self, interaction: discord.Interaction):
+        content, path, note_msg = process_cancel_note(self.task_name, self.cause_input.value, self.fix_input.value)
+        for c in self.approval_view.children:
+            c.disabled = True
+        await interaction.response.defer()
+        await interaction.message.edit(
+            content=f"❌ **취소됨**\n{note_msg}",
+            view=self.approval_view,
+        )
+
+
 class ApprovalView(discord.ui.View):
-    def __init__(self):
+    def __init__(self, task_name: str = "작업"):
         super().__init__(timeout=None)
+        self.task_name = task_name
 
     @discord.ui.button(label="승인", style=discord.ButtonStyle.success, emoji="✅")
     async def approve(self, i, b):
@@ -191,9 +222,7 @@ class ApprovalView(discord.ui.View):
 
     @discord.ui.button(label="취소", style=discord.ButtonStyle.danger, emoji="❌")
     async def cancel(self, i, b):
-        for c in self.children:
-            c.disabled = True
-        await i.response.edit_message(content="❌ **취소됨**", view=self)
+        await i.response.send_modal(CancelModal(task_name=self.task_name, view=self))
 
 
 # ── 스킬 승격 제안 버튼 (메모리 학습 핵심) ──
@@ -421,7 +450,7 @@ async def on_message(message):
                 f"🔍 **교차 2심** ({reviewer_label})\n{review_txt}\n"
                 f"───────────────"
             ),
-            view=ApprovalView(),
+            view=ApprovalView(task_name=task_type),
         )
 
         # 패턴 감지 → 스킬 승격 제안 (임계값 도달 + 아직 제안 안 한 유형)

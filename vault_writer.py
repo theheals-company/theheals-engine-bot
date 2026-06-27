@@ -85,6 +85,35 @@ def save_skill_to_vault(path: str, content: str, message: str) -> dict:
     return {"ok": True, "path": path, "url": resp.json()["content"]["html_url"]}
 
 
+def process_cancel_note(task_name: str, cause_raw: str, fix_raw: str) -> tuple:
+    """취소 오답노트 순수 로직. 반환: (content, path, note_msg)"""
+    cause = cause_raw.strip() or "(취소 사유 미입력)"
+    fix = fix_raw.strip() or "(취소 사유 미입력)"
+    content = build_mistake_note(task_name, cause, fix)
+    today = datetime.date.today().isoformat()
+    path = f"10_WIKI/오답노트/{today}-{slugify(task_name)}.md"
+    try:
+        result = save_skill_to_vault(
+            path=path,
+            content=content,
+            message=f"오답노트: {task_name}",
+        )
+        if result["ok"]:
+            note_msg = f"📝 오답노트 기록됨: {path}"
+        else:
+            note_msg = f"⚠️ 오답노트 기록 실패: {result['reason']}"
+    except Exception as e:
+        note_msg = f"⚠️ 오답노트 기록 실패: {e}"
+    return content, path, note_msg
+
+
+def slugify(text: str) -> str:
+    """공백→하이픈, 특수문자 제거, 한글 허용."""
+    text = re.sub(r"[^\w\s]", "", text)
+    text = re.sub(r"\s+", "-", text.strip())
+    return text[:50]
+
+
 def build_mistake_note(task: str, cause: str, fix: str) -> str:
     today = datetime.date.today().isoformat()
     return (
