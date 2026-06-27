@@ -17,7 +17,7 @@ import discord
 from discord.ext import tasks
 
 from core import models_loader
-from vault_writer import build_mistake_note, process_cancel_note, save_skill_to_vault, slugify
+from vault_writer import process_cancel_note, save_skill_to_vault
 
 DISCORD_TOKEN = os.environ["DISCORD_TOKEN"]
 ANTHROPIC_API_KEY = os.environ.get("ANTHROPIC_API_KEY", "")
