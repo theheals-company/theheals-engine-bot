@@ -17,7 +17,7 @@ import discord
 from discord.ext import tasks
 
 from core import models_loader
-from vault_writer import process_cancel_note, save_skill_to_vault
+from vault_writer import process_cancel_note, promote_fail_pattern, record_fail_pattern, save_skill_to_vault
 
 DISCORD_TOKEN = os.environ["DISCORD_TOKEN"]
 ANTHROPIC_API_KEY = os.environ.get("ANTHROPIC_API_KEY", "")
@@ -192,6 +192,7 @@ class CancelModal(discord.ui.Modal, title="취소 사유 입력"):
         self.approval_view = view
 
     async def on_submit(self, interaction: discord.Interaction):
+        fix_normalized = self.fix_input.value.strip() or "(취소 사유 미입력)"
         content, path, note_msg = process_cancel_note(self.task_name, self.cause_input.value, self.fix_input.value)
         for c in self.approval_view.children:
             c.disabled = True
@@ -200,6 +201,19 @@ class CancelModal(discord.ui.Modal, title="취소 사유 입력"):
             content=f"❌ **취소됨**\n{note_msg}",
             view=self.approval_view,
         )
+        # 오답노트 저장 성공 시 실패 카운터 업데이트 → 임계 도달 시 승격 제안
+        if note_msg.startswith("📝") and interaction.guild:
+            fail_result = record_fail_pattern(self.task_name)
+            if fail_result["threshold_reached"]:
+                approval_ch = discord.utils.get(interaction.guild.text_channels, name=APPROVAL_CHANNEL)
+                if approval_ch:
+                    await approval_ch.send(
+                        content=(
+                            f"⚠️ '{self.task_name}' 작업이 {fail_result['count']}회 반려됐습니다. "
+                            f"방지책을 스킬로 승격할까요?"
+                        ),
+                        view=FailPromoteView(task_type=self.task_name, fix_content=fix_normalized),
+                    )
 
 
 class ApprovalView(discord.ui.View):
@@ -223,6 +237,35 @@ class ApprovalView(discord.ui.View):
     @discord.ui.button(label="취소", style=discord.ButtonStyle.danger, emoji="❌")
     async def cancel(self, i, b):
         await i.response.send_modal(CancelModal(task_name=self.task_name, view=self))
+
+
+# ── 실패 패턴 스킬 승격 제안 (4-C-3) ──
+class FailPromoteView(discord.ui.View):
+    def __init__(self, task_type: str, fix_content: str = ""):
+        super().__init__(timeout=None)
+        self.task_type = task_type
+        self.fix_content = fix_content
+
+    @discord.ui.button(label="승격", style=discord.ButtonStyle.success, emoji="✅")
+    async def promote(self, i, b):
+        await i.response.defer()
+        for c in self.children:
+            c.disabled = True
+        try:
+            result = promote_fail_pattern(self.task_type, self.fix_content)
+            if result["ok"]:
+                msg = f"✅ 방지책 스킬 승격 완료: {result['path']}"
+            else:
+                msg = f"🔴 승격 실패: {result['reason']}"
+        except Exception as e:
+            msg = f"🔴 승격 실패: {e}"
+        await i.edit_original_response(content=msg, view=self)
+
+    @discord.ui.button(label="보류", style=discord.ButtonStyle.secondary, emoji="❌")
+    async def skip(self, i, b):
+        for c in self.children:
+            c.disabled = True
+        await i.response.edit_message(content=f"❌ '{self.task_type}' 스킬 승격 보류됨", view=self)
 
 
 # ── 스킬 승격 제안 버튼 (메모리 학습 핵심) ──
