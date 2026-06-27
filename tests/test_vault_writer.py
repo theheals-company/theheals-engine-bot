@@ -63,6 +63,7 @@ def test_happy_path_passes_guards_and_writes(monkeypatch):
 
 # ── 4-C-1 시나리오 A/B/C/D ────────────────────────────────────────────────
 
+
 def _fake_requests(monkeypatch):
     """공통 네트워크 목(mock) 설정. put_called 리스트로 호출 여부 추적."""
     monkeypatch.setenv("GITHUB_TOKEN", "dummy-not-real")
