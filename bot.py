@@ -17,7 +17,7 @@ import discord
 from discord.ext import tasks
 
 from core import models_loader
-from vault_writer import process_cancel_note, promote_fail_pattern, record_fail_pattern, save_skill_to_vault
+from vault_writer import process_cancel_note, promote_fail_pattern, record_fail_pattern
 
 DISCORD_TOKEN = os.environ["DISCORD_TOKEN"]
 ANTHROPIC_API_KEY = os.environ.get("ANTHROPIC_API_KEY", "")
@@ -26,7 +26,6 @@ GEMINI_API_KEY = os.environ.get("GEMINI_API_KEY", "")
 ORDER_CHANNEL = os.environ.get("ORDER_CHANNEL", "발주")
 APPROVAL_CHANNEL = os.environ.get("APPROVAL_CHANNEL", "승인대기")
 BRIEFING_CHANNEL = os.environ.get("BRIEFING_CHANNEL", "일일브리핑")
-MISTAKE_CHANNEL = os.environ.get("MISTAKE_CHANNEL", "오답노트")  # AgentShield 차단 알림용
 KST = ZoneInfo("Asia/Seoul")
 BRIEFING_HOUR = int(os.environ.get("BRIEFING_HOUR", "7"))  # KST 기준 시각
 
@@ -251,14 +250,12 @@ class FailPromoteView(discord.ui.View):
         await i.response.defer()
         for c in self.children:
             c.disabled = True
-        try:
-            result = promote_fail_pattern(self.task_type, self.fix_content)
-            if result["ok"]:
-                msg = f"✅ 방지책 스킬 승격 완료: {result['path']}"
-            else:
-                msg = f"🔴 승격 실패: {result['reason']}"
-        except Exception as e:
-            msg = f"🔴 승격 실패: {e}"
+        result = promote_fail_pattern(self.task_type, self.fix_content)
+        msg = (
+            f"📋 **스킬 승격 제안 발행** — `{result['path']}`\n\n"
+            f"{result['content'][:1400]}\n\n"
+            f"— — —\n💾 파일 저장은 이번 범위 밖(별도 PR 경로 예정). 검토 후 수동 저장하세요."
+        )
         await i.edit_original_response(content=msg, view=self)
 
     @discord.ui.button(label="보류", style=discord.ButtonStyle.secondary, emoji="❌")
@@ -290,24 +287,6 @@ class PromoteView(discord.ui.View):
             draft, _ = call_model(models_loader.get_model("design"), SYSTEM_PROMPT, draft_prompt, 1500)
         except Exception as e:
             draft = f"⚠️ 초안 생성 오류: {e}"
-        # === 길B: 승인된 초안을 볼트에 자동 저장 (정상 초안일 때만) ===
-        save_msg = ""
-        if not draft.startswith("⚠️"):
-            try:
-                result = save_skill_to_vault(
-                    path=f"20_SKILLS/{self.task_type}-스킬.md",
-                    content=draft,
-                    message=f"길B 자동저장: {self.task_type} 스킬 승격 (대표 승인)",
-                )
-                save_msg = f"\n\n🟢 **볼트 자동저장 완료** → {result['url']}"
-            except Exception as e:
-                save_msg = f"\n\n🔴 **저장 실패** (수동 저장 필요): {e}"
-                # AgentShield 차단이면 #오답노트에 자동 알림 (비밀값 없이 사유·파일명만)
-                if "AgentShield" in str(e):
-                    mch = discord.utils.get(i.guild.text_channels, name=MISTAKE_CHANNEL)
-                    if mch:
-                        await mch.send(f"🛡️ AgentShield 차단 — {self.task_type}: {e}")
-        # ============================================================
 
         await i.edit_original_response(
             content=f"✅ **스킬 승격 승인됨** — '{self.task_type}'\n\n"
@@ -315,7 +294,7 @@ class PromoteView(discord.ui.View):
             f"— — —\n"
             f"💾 **저장 방법:** 위 초안을 검토 후 Claude Code(또는 옵시디언)로 "
             f"`20_SKILLS/{self.task_type}-스킬.md`에 저장하세요. "
-            f"헌법 제5조에 따라 INDEX·LOG 등록도 함께." + save_msg,
+            f"헌법 제5조에 따라 INDEX·LOG 등록도 함께.",
             view=self,
         )
 

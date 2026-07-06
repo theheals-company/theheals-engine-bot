@@ -37,8 +37,8 @@ def test_scenario_c_independent_counters(monkeypatch):
     assert vault_writer._fail_counts["코드작업"] == 2
 
 
-def test_scenario_d_promote_saves_to_skills(monkeypatch):
-    """D) 승격 시 save_skill_to_vault가 20_SKILLS/ 경로로 호출."""
+def test_scenario_d_promote_returns_draft_without_saving(monkeypatch):
+    """D) 승격 시 파일 저장 없이 20_SKILLS/ 제안 경로 + 초안 내용만 반환 (길B 자동저장 역전)."""
     save_calls = []
 
     def mock_save(path, content, message):
@@ -47,9 +47,10 @@ def test_scenario_d_promote_saves_to_skills(monkeypatch):
 
     monkeypatch.setattr(vault_writer, "save_skill_to_vault", mock_save)
     result = vault_writer.promote_fail_pattern("코드작업", "더 꼼꼼히 확인")
-    assert len(save_calls) == 1
-    assert save_calls[0].startswith("20_SKILLS/")
+    assert save_calls == [], "promote_fail_pattern은 더 이상 save_skill_to_vault를 호출하면 안 됨"
     assert result["ok"] is True
+    assert result["path"].startswith("20_SKILLS/")
+    assert "더 꼼꼼히 확인" in result["content"]
 
 
 def test_scenario_e_fail_counts_path_allowed():

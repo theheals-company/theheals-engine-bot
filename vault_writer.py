@@ -1,4 +1,4 @@
-# vault_writer.py — 길 B 영구기억: 봇 → GitHub 볼트 저장 (20_SKILLS 전용)
+# vault_writer.py — 길 B 영구기억: 봇 → GitHub 볼트 저장 (10_WIKI 저위험 로그 전용)
 import base64
 import datetime
 import json
@@ -10,7 +10,8 @@ import requests
 
 logger = logging.getLogger(__name__)
 
-ALLOWED_PREFIX = ("20_SKILLS/", "10_WIKI/오답노트/")  # 가드레일1: 허용 경로 목록
+ALLOWED_PREFIX = ("10_WIKI/오답노트/", "10_WIKI/진화창고/")  # 가드레일1: 허용 경로 목록
+VAULT_BRANCH = "vault-sync"  # 유일하게 쓰기 가능한 볼트 브랜치 — main 직접 지정 자체가 불가
 FAIL_THRESHOLD = 2  # 실패 누적 임계값 (성공쪽 PROMOTE_THRESHOLD=3과 별도)
 _fail_counts: dict = {}  # 메모리 내 실패 카운터 (프로세스 재시작 시 초기화)
 SECRET_PATTERNS = [  # 가드레일3: 비밀키 평문 차단
@@ -50,7 +51,7 @@ def shield_check(content: str, filename: str):
     return True, "통과(코드 파일, 위험패턴 없음)"
 
 
-def save_skill_to_vault(path: str, content: str, message: str) -> dict:
+def save_skill_to_vault(path: str, content: str, message: str, branch: str = VAULT_BRANCH) -> dict:
     # 가드레일1: 화이트리스트
     if not path.startswith(ALLOWED_PREFIX):
         raise ValueError(f"거부: {ALLOWED_PREFIX} 외 경로 쓰기 금지 → {path}")
@@ -62,19 +63,26 @@ def save_skill_to_vault(path: str, content: str, message: str) -> dict:
     if not ok:
         raise ValueError(f"거부: {reason}")
     _check_secrets(content)
+    # 가드레일5: 쓰기 대상 브랜치 고정 — main 등 다른 브랜치 지정 자체를 차단
+    if branch != VAULT_BRANCH:
+        raise ValueError(f"거부: 쓰기 가능 브랜치는 '{VAULT_BRANCH}'뿐 → {branch}")
 
     token = os.environ["GITHUB_TOKEN"]  # Render 환경변수에서만
     repo = os.environ["VAULT_REPO"]  # theheals-company/theheals-engine-vault
     url = f"https://api.github.com/repos/{repo}/contents/{path}"
     headers = {"Authorization": f"Bearer {token}", "Accept": "application/vnd.github+json"}
 
-    # 기존 파일이면 SHA 확보(업데이트), 없으면 신규 생성
+    # 기존 파일이면 SHA 확보(업데이트), 없으면 신규 생성 (vault-sync 브랜치 기준)
     sha = None
-    r = requests.get(url, headers=headers, timeout=15)
+    r = requests.get(url, headers=headers, params={"ref": branch}, timeout=15)
     if r.status_code == 200:
         sha = r.json()["sha"]
 
-    body = {"message": message, "content": base64.b64encode(content.encode()).decode()}
+    body = {
+        "message": message,
+        "content": base64.b64encode(content.encode()).decode(),
+        "branch": branch,
+    }
     if sha:
         body["sha"] = sha
 
@@ -145,11 +153,8 @@ def record_fail_pattern(task_type: str) -> dict:
 
 
 def promote_fail_pattern(task_type: str, fix_content: str) -> dict:
-    """실패패턴 방지책을 20_SKILLS/ 스킬 초안으로 저장."""
+    """실패패턴 방지책 스킬 초안 생성. 파일 저장은 하지 않음 —
+    반환값은 #승인대기 채널 메시지 발행용(파일화는 별도 PR 경로, 이번 범위 밖)."""
     skill_content = f"---\nsensitivity: S0\n---\n# {task_type} — 반복 실패 방지 스킬\n\n## 방지책\n{fix_content}\n"
     path = f"20_SKILLS/{slugify(task_type)}-방지책-스킬.md"
-    return save_skill_to_vault(
-        path=path,
-        content=skill_content,
-        message=f"실패패턴 스킬 승격: {task_type}",
-    )
+    return {"ok": True, "path": path, "content": skill_content}
