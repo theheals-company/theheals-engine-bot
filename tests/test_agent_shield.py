@@ -26,4 +26,4 @@ def test_shield_exempts_md_documents():
 def test_save_and_chains_shield_for_code_file():
     """가드: save_skill_to_vault가 .py+코드패턴을 AND 체이닝으로 거부(네트워크 도달 전)."""
     with pytest.raises(ValueError, match="AgentShield"):
-        vault_writer.save_skill_to_vault("20_SKILLS/x.py", "subprocess.run(['rm','-rf'])", "msg")
+        vault_writer.save_skill_to_vault("10_WIKI/오답노트/x.py", "subprocess.run(['rm','-rf'])", "msg")

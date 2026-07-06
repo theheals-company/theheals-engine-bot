@@ -17,9 +17,9 @@ def test_guardrail1_rejects_path_outside_whitelist():
 
 
 def test_guardrail2_rejects_path_traversal():
-    """가드레일2: 20_SKILLS/로 시작해도 .. 포함 시 거부."""
+    """가드레일2: 10_WIKI/오답노트/로 시작해도 .. 포함 시 거부."""
     with pytest.raises(ValueError, match="비정상 경로"):
-        vault_writer.save_skill_to_vault("20_SKILLS/../etc/passwd", "내용", "msg")
+        vault_writer.save_skill_to_vault("10_WIKI/오답노트/../etc/passwd", "내용", "msg")
 
 
 def test_guardrail3_rejects_secret_in_content():
@@ -28,7 +28,7 @@ def test_guardrail3_rejects_secret_in_content():
           비밀키처럼 '보이는' 문자열을 런타임에 조립한다(파일에 리터럴로 박지 않음)."""
     fake_secret = "ghp_" + "A" * 30  # ghp_\w+ 패턴에만 매칭, 실제 키 아님
     with pytest.raises(ValueError, match="비밀키"):
-        vault_writer.save_skill_to_vault("20_SKILLS/ok.md", f"문서\n{fake_secret}\n", "msg")
+        vault_writer.save_skill_to_vault("10_WIKI/오답노트/ok.md", f"문서\n{fake_secret}\n", "msg")
 
 
 def test_happy_path_passes_guards_and_writes(monkeypatch):
@@ -56,16 +56,16 @@ def test_happy_path_passes_guards_and_writes(monkeypatch):
     monkeypatch.setattr(vault_writer.requests, "get", fake_get)
     monkeypatch.setattr(vault_writer.requests, "put", fake_put)
 
-    out = vault_writer.save_skill_to_vault("20_SKILLS/clean.md", "안전한 내용", "test")
+    out = vault_writer.save_skill_to_vault("10_WIKI/오답노트/clean.md", "안전한 내용", "test")
     assert out["ok"] is True
-    assert out["path"] == "20_SKILLS/clean.md"
+    assert out["path"] == "10_WIKI/오답노트/clean.md"
 
 
 # ── 4-C-1 시나리오 A/B/C/D ────────────────────────────────────────────────
 
 
 def _fake_requests(monkeypatch):
-    """공통 네트워크 목(mock) 설정. put_called 리스트로 호출 여부 추적."""
+    """공통 네트워크 목(mock) 설정. put_called 리스트에 호출별 kwargs 기록(호출 여부·횟수·페이로드 모두 검증 가능)."""
     monkeypatch.setenv("GITHUB_TOKEN", "dummy-not-real")
     monkeypatch.setenv("VAULT_REPO", "owner/repo")
 
@@ -84,7 +84,7 @@ def _fake_requests(monkeypatch):
         return FakeResp()
 
     def fake_put(*a, **k):
-        put_called.append(True)
+        put_called.append(k)
         r = FakeResp()
         r.status_code = 201
         return r
@@ -98,20 +98,39 @@ def test_scenario_a_s2_blocked(monkeypatch):
     """A) sensitivity: S2 포함 → S2_BLOCKED 반환, PUT 미호출."""
     put_called = _fake_requests(monkeypatch)
     content = "---\nsensitivity: S2\n---\n민감한 내용"
-    out = vault_writer.save_skill_to_vault("20_SKILLS/secret.md", content, "msg")
+    out = vault_writer.save_skill_to_vault("10_WIKI/오답노트/secret.md", content, "msg")
     assert out["ok"] is False
     assert out["reason"] == "S2_BLOCKED"
-    assert out["path"] == "20_SKILLS/secret.md"
+    assert out["path"] == "10_WIKI/오답노트/secret.md"
     assert put_called == [], "PUT이 호출되면 안 됨"
 
 
-def test_scenario_b_s0_skills_path(monkeypatch):
-    """B) sensitivity: S0, 경로 20_SKILLS/ → PUT 호출, ok=True."""
+def test_scenario_b_s0_skills_path_now_rejected(monkeypatch):
+    """B) (반전) 20_SKILLS/는 더 이상 화이트리스트 대상이 아님 → 거부, PUT 미호출."""
     put_called = _fake_requests(monkeypatch)
     content = "---\nsensitivity: S0\n---\n안전한 스킬 내용"
-    out = vault_writer.save_skill_to_vault("20_SKILLS/safe.md", content, "msg")
+    with pytest.raises(ValueError, match="경로 쓰기 금지"):
+        vault_writer.save_skill_to_vault("20_SKILLS/safe.md", content, "msg")
+    assert put_called == [], "PUT이 호출되면 안 됨"
+
+
+def test_scenario_e_vault_sync_branch_write_succeeds(monkeypatch):
+    """E) 허용 경로 쓰기는 vault-sync 브랜치를 대상으로 PUT 호출됨 (main 아님)."""
+    put_called = _fake_requests(monkeypatch)
+    content = "---\nsensitivity: S0\n---\n안전한 오답노트 내용"
+    out = vault_writer.save_skill_to_vault("10_WIKI/오답노트/safe.md", content, "msg")
     assert out["ok"] is True
     assert len(put_called) == 1, "PUT이 정확히 한 번 호출되어야 함"
+    assert put_called[0]["json"]["branch"] == "vault-sync"
+
+
+def test_main_branch_target_rejected(monkeypatch):
+    """branch="main"을 명시적으로 지정해도 거부됨 — main 직접 대상 쓰기 원천 차단."""
+    put_called = _fake_requests(monkeypatch)
+    content = "---\nsensitivity: S0\n---\n안전한 내용"
+    with pytest.raises(ValueError, match="vault-sync"):
+        vault_writer.save_skill_to_vault("10_WIKI/오답노트/x.md", content, "msg", branch="main")
+    assert put_called == [], "PUT이 호출되면 안 됨"
 
 
 def test_scenario_c_s0_mistake_note_path(monkeypatch):
