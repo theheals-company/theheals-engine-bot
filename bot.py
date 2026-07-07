@@ -35,6 +35,12 @@ BRIEFING_HOUR = int(os.environ.get("BRIEFING_HOUR", "7"))  # KST 기준 시각
 # 패턴 승격 임계값 (자료 ⑬: 3개 이상이면 스킬 후보)
 PROMOTE_THRESHOLD = int(os.environ.get("PROMOTE_THRESHOLD", "3"))
 
+# ── 승인대기 워치독 (2026-07-07: Render 강제종료로 인한 고아 메시지 사고 대응) ──
+APPROVAL_TIMEOUT_SECONDS = int(os.environ.get("APPROVAL_TIMEOUT_SECONDS", str(15 * 60)))  # 최종상태 미전이 시 타임아웃
+APPROVAL_RECOVERY_SCAN_LIMIT = 200  # 부팅 시 되돌아볼 #승인대기 메시지 개수 상한
+APPROVAL_PENDING_PREFIX = "📋 **승인 대기**"  # 아직 최종 상태로 전이되지 않은 메시지 식별용
+APPROVAL_TIMEOUT_MESSAGE = "⏱️ 처리 중단됨 — 재확인 필요"
+
 SYSTEM_PROMPT = """당신은 더힐즈컴퍼니(The Heals Company)의 더힐즈 엔진 PM 에이전트 '지아'입니다.
 회사 영문 표기는 The Heals (절대 The Hills 아님).
 [국면 모드] 매 발주마다 🔵CREATE(추론우선)/🟢SCALE(효율) 먼저 제안. 애매하면 CREATE.
@@ -200,6 +206,7 @@ class CancelModal(discord.ui.Modal, title="취소 사유 입력"):
             content=f"❌ **취소됨**\n{note_msg}",
             view=self.approval_view,
         )
+        self.approval_view.stop()  # 최종 상태 도달 — 워치독 타임아웃 정지
         # 오답노트 저장 성공 시 실패 카운터 업데이트 → 임계 도달 시 승격 제안
         if note_msg.startswith("📝") and interaction.guild:
             fail_result = record_fail_pattern(self.task_name)
@@ -217,8 +224,19 @@ class CancelModal(discord.ui.Modal, title="취소 사유 입력"):
 
 class ApprovalView(discord.ui.View):
     def __init__(self, task_name: str = "작업"):
-        super().__init__(timeout=None)
+        super().__init__(timeout=APPROVAL_TIMEOUT_SECONDS)
         self.task_name = task_name
+        self.message: discord.Message | None = None  # 전송 직후 호출부에서 설정 — 워치독이 편집할 대상
+
+    async def on_timeout(self):
+        """워치독: APPROVAL_TIMEOUT_SECONDS 내 최종 상태(승인/취소)로 전이되지 않으면 메시지 갱신."""
+        for c in self.children:
+            c.disabled = True
+        if self.message is not None:
+            try:
+                await self.message.edit(content=APPROVAL_TIMEOUT_MESSAGE, view=self)
+            except discord.HTTPException:
+                pass  # 메시지가 이미 삭제됐거나 편집 불가한 경우 — 워치독 자체가 실패해선 안 됨
 
     @discord.ui.button(label="승인", style=discord.ButtonStyle.success, emoji="✅")
     async def approve(self, i, b):
@@ -226,12 +244,14 @@ class ApprovalView(discord.ui.View):
             c.disabled = True
         now = datetime.datetime.now().strftime("%m-%d %H:%M")
         await i.response.edit_message(content=f"✅ **승인됨** ({now})", view=self)
+        self.stop()  # 최종 상태 도달 — 워치독 타임아웃 정지
 
     @discord.ui.button(label="수정", style=discord.ButtonStyle.primary, emoji="✏️")
     async def revise(self, i, b):
         for c in self.children:
             c.disabled = True
         await i.response.edit_message(content="✏️ **수정 요청됨**", view=self)
+        self.stop()  # 최종 상태 도달 — 워치독 타임아웃 정지
 
     @discord.ui.button(label="취소", style=discord.ButtonStyle.danger, emoji="❌")
     async def cancel(self, i, b):
@@ -398,12 +418,42 @@ async def daily_briefing():
                 await ch.send(content[idx : idx + 1900])
 
 
+async def startup_recovery(client: discord.Client | None = None) -> int:
+    """부팅 시 복구: 재시작(예: Render 강제종료)으로 워치독이 소실된 사이 '진행중'
+    (APPROVAL_PENDING_PREFIX, 미전이) 상태로 남은 #승인대기 메시지를 스캔해 타임아웃
+    초과분을 워치독(ApprovalView.on_timeout)과 동일하게 정리한다.
+    별도 DB 없음 — Discord 메시지 자체를 상태 저장소로 삼아 재구성(카파시2원칙: 최소 수정)."""
+    client = client or bot
+    cutoff = datetime.datetime.now(datetime.timezone.utc) - datetime.timedelta(seconds=APPROVAL_TIMEOUT_SECONDS)
+    recovered = 0
+    for guild in client.guilds:
+        ch = discord.utils.get(guild.text_channels, name=APPROVAL_CHANNEL)
+        if not ch:
+            continue
+        async for msg in ch.history(limit=APPROVAL_RECOVERY_SCAN_LIMIT):
+            if msg.author != client.user:
+                continue
+            if not msg.content.startswith(APPROVAL_PENDING_PREFIX):
+                continue  # 이미 최종 상태로 전이됨 — 대상 아님
+            if msg.created_at >= cutoff:
+                continue  # 아직 타임아웃 전
+            try:
+                await msg.edit(content=APPROVAL_TIMEOUT_MESSAGE, view=None)
+                recovered += 1
+            except discord.HTTPException:
+                pass
+    if recovered:
+        print(f"[승인대기 복구] 부팅 시 고아 항목 {recovered}건 정리")
+    return recovered
+
+
 @bot.event
 async def on_ready():
     print(f"[더힐즈 엔진 봇 v0.8 검색효율화] 로그인: {bot.user}")
     if not daily_briefing.is_running():
         daily_briefing.start()
         print(f"[브리핑] 매일 KST {BRIEFING_HOUR:02d}:00 자동 게시 예약됨")
+    await startup_recovery()
 
 
 @bot.event
@@ -465,15 +515,17 @@ async def on_message(message):
         draft_txt = answer if len(answer) <= 1200 else answer[:1200] + "…(생략)"
         review_txt = review if len(review) <= 600 else review[:600] + "…(생략)"
         # 일반 승인 게이트 (교차 2심 결과 병기)
-        await approval_ch.send(
+        approval_view = ApprovalView(task_name=task_type)
+        approval_msg = await approval_ch.send(
             content=(
-                f"📋 **승인 대기**\n{draft_txt}\n"
+                f"{APPROVAL_PENDING_PREFIX}\n{draft_txt}\n"
                 f"───────────────\n"
                 f"🔍 **교차 2심** ({reviewer_label})\n{review_txt}\n"
                 f"───────────────"
             ),
-            view=ApprovalView(task_name=task_type),
+            view=approval_view,
         )
+        approval_view.message = approval_msg  # 워치독(on_timeout)이 편집할 대상
 
         # 패턴 감지 → 스킬 승격 제안 (임계값 도달 + 아직 제안 안 한 유형)
         if pattern_counts[task_type] >= PROMOTE_THRESHOLD and task_type not in promoted:
