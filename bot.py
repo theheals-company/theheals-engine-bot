@@ -16,7 +16,7 @@ import anthropic
 import discord
 from discord.ext import tasks
 
-from core import models_loader
+from core import models_loader, orders_store
 from vault_writer import process_cancel_note, promote_fail_pattern, record_fail_pattern
 
 DISCORD_TOKEN = os.environ["DISCORD_TOKEN"]
@@ -26,6 +26,9 @@ GEMINI_API_KEY = os.environ.get("GEMINI_API_KEY", "")
 ORDER_CHANNEL = os.environ.get("ORDER_CHANNEL", "발주")
 APPROVAL_CHANNEL = os.environ.get("APPROVAL_CHANNEL", "승인대기")
 BRIEFING_CHANNEL = os.environ.get("BRIEFING_CHANNEL", "일일브리핑")
+PROGRESS_CHANNEL = os.environ.get("PROGRESS_CHANNEL", "진행상황")
+# 대표 멘션 — Discord 유저 ID(숫자). 미설정 시 멘션 생략(가치 없는 @everyone류 금지).
+PRINCIPAL_MENTION_ID = os.environ.get("PRINCIPAL_MENTION_ID", "")
 KST = ZoneInfo("Asia/Seoul")
 BRIEFING_HOUR = int(os.environ.get("BRIEFING_HOUR", "7"))  # KST 기준 시각
 
@@ -177,6 +180,25 @@ intents.message_content = True
 bot = discord.Client(intents=intents)
 
 
+# ── ORD-ID 백본 (발주서 §2) — 상태 전이마다 #진행상황에 1줄 게시 ──
+async def post_progress(
+    guild: discord.Guild | None, order_id: str, status: str, source_message: discord.Message | None = None
+) -> None:
+    """[ORD-ID] 상태: {status} 1줄을 #진행상황에 게시(원 발주 메시지 점프링크 동봉)."""
+    if guild is None:
+        return
+    ch = discord.utils.get(guild.text_channels, name=PROGRESS_CHANNEL)
+    if not ch:
+        return
+    line = f"[{order_id}] 상태: {status}"
+    if source_message is not None:
+        line += f" | {source_message.jump_url}"
+    try:
+        await ch.send(line)
+    except discord.HTTPException:
+        pass  # 진행상황 게시 실패가 본 파이프라인을 막아선 안 됨(fail-open)
+
+
 class CancelModal(discord.ui.Modal, title="취소 사유 입력"):
     cause_input = discord.ui.TextInput(
         label="원인",
@@ -201,12 +223,16 @@ class CancelModal(discord.ui.Modal, title="취소 사유 입력"):
         content, path, note_msg = process_cancel_note(self.task_name, self.cause_input.value, self.fix_input.value)
         for c in self.approval_view.children:
             c.disabled = True
+            c.style = discord.ButtonStyle.secondary
         await interaction.response.defer()
         await interaction.message.edit(
             content=f"❌ **취소됨**\n{note_msg}",
             view=self.approval_view,
         )
         self.approval_view.stop()  # 최종 상태 도달 — 워치독 타임아웃 정지
+        if self.approval_view.order_id:
+            orders_store.update_status(self.approval_view.order_id, "반려")
+            await post_progress(interaction.guild, self.approval_view.order_id, "반려")
         # 오답노트 저장 성공 시 실패 카운터 업데이트 → 임계 도달 시 승격 제안
         if note_msg.startswith("📝") and interaction.guild:
             fail_result = record_fail_pattern(self.task_name)
@@ -223,35 +249,47 @@ class CancelModal(discord.ui.Modal, title="취소 사유 입력"):
 
 
 class ApprovalView(discord.ui.View):
-    def __init__(self, task_name: str = "작업"):
+    def __init__(self, task_name: str = "작업", order_id: str | None = None):
         super().__init__(timeout=APPROVAL_TIMEOUT_SECONDS)
         self.task_name = task_name
+        self.order_id = order_id  # ORD-ID 백본(§2) — 있으면 상태전이를 orders.db + #진행상황에 반영
         self.message: discord.Message | None = None  # 전송 직후 호출부에서 설정 — 워치독이 편집할 대상
 
     async def on_timeout(self):
         """워치독: APPROVAL_TIMEOUT_SECONDS 내 최종 상태(승인/취소)로 전이되지 않으면 메시지 갱신."""
         for c in self.children:
             c.disabled = True
+            c.style = discord.ButtonStyle.secondary
         if self.message is not None:
             try:
                 await self.message.edit(content=APPROVAL_TIMEOUT_MESSAGE, view=self)
             except discord.HTTPException:
                 pass  # 메시지가 이미 삭제됐거나 편집 불가한 경우 — 워치독 자체가 실패해선 안 됨
+        if self.order_id:
+            orders_store.update_status(self.order_id, "타임아웃")
 
     @discord.ui.button(label="승인", style=discord.ButtonStyle.success, emoji="✅")
     async def approve(self, i, b):
         for c in self.children:
             c.disabled = True
+            c.style = discord.ButtonStyle.secondary
         now = datetime.datetime.now().strftime("%m-%d %H:%M")
         await i.response.edit_message(content=f"✅ **승인됨** ({now})", view=self)
         self.stop()  # 최종 상태 도달 — 워치독 타임아웃 정지
+        if self.order_id:
+            orders_store.update_status(self.order_id, "완결")
+            await post_progress(i.guild, self.order_id, "완결")
 
     @discord.ui.button(label="수정", style=discord.ButtonStyle.primary, emoji="✏️")
     async def revise(self, i, b):
         for c in self.children:
             c.disabled = True
+            c.style = discord.ButtonStyle.secondary
         await i.response.edit_message(content="✏️ **수정 요청됨**", view=self)
         self.stop()  # 최종 상태 도달 — 워치독 타임아웃 정지
+        if self.order_id:
+            orders_store.update_status(self.order_id, "수정요청")
+            await post_progress(i.guild, self.order_id, "수정요청")
 
     @discord.ui.button(label="취소", style=discord.ButtonStyle.danger, emoji="❌")
     async def cancel(self, i, b):
@@ -418,12 +456,38 @@ async def daily_briefing():
                 await ch.send(content[idx : idx + 1900])
 
 
-async def startup_recovery(client: discord.Client | None = None) -> int:
-    """부팅 시 복구: 재시작(예: Render 강제종료)으로 워치독이 소실된 사이 '진행중'
-    (APPROVAL_PENDING_PREFIX, 미전이) 상태로 남은 #승인대기 메시지를 스캔해 타임아웃
-    초과분을 워치독(ApprovalView.on_timeout)과 동일하게 정리한다.
-    별도 DB 없음 — Discord 메시지 자체를 상태 저장소로 삼아 재구성(카파시2원칙: 최소 수정)."""
-    client = client or bot
+async def _startup_recovery_from_db(client: discord.Client) -> int:
+    """DB 우선 경로(ORD-2026-0708-P1): orders.db에서 미결+타임아웃 초과 발주를 조회해
+    해당 approval_msg_id 메시지만 정확히 fetch해 정리. 채널 전체 스캔 불필요."""
+    recovered = 0
+    stale = orders_store.list_stale_open_orders(APPROVAL_TIMEOUT_SECONDS)
+    if not stale:
+        return 0
+    for guild in client.guilds:
+        ch = discord.utils.get(guild.text_channels, name=APPROVAL_CHANNEL)
+        if not ch:
+            continue
+        for order in stale:
+            try:
+                msg = await ch.fetch_message(int(order["approval_msg_id"]))
+            except (discord.HTTPException, ValueError):
+                continue
+            if msg.author != client.user:
+                continue
+            if not msg.content.startswith(APPROVAL_PENDING_PREFIX):
+                continue  # 이미 최종 상태로 전이됨 — 대상 아님
+            try:
+                await msg.edit(content=APPROVAL_TIMEOUT_MESSAGE, view=None)
+                orders_store.update_status(order["id"], "타임아웃")
+                recovered += 1
+            except discord.HTTPException:
+                pass
+    return recovered
+
+
+async def _startup_recovery_channel_scan(client: discord.Client) -> int:
+    """Fallback: DB에 없는(마이그레이션 이전) 고아 메시지 대비 채널 전체 스캔.
+    별도 DB 없이도 동작하던 기존 로직 그대로 — 카파시2원칙(최소 수정) 유지."""
     cutoff = datetime.datetime.now(datetime.timezone.utc) - datetime.timedelta(seconds=APPROVAL_TIMEOUT_SECONDS)
     recovered = 0
     for guild in client.guilds:
@@ -442,6 +506,17 @@ async def startup_recovery(client: discord.Client | None = None) -> int:
                 recovered += 1
             except discord.HTTPException:
                 pass
+    return recovered
+
+
+async def startup_recovery(client: discord.Client | None = None) -> int:
+    """부팅 시 복구: 재시작(예: Render 강제종료)으로 워치독이 소실된 사이 '진행중'
+    상태로 남은 #승인대기 메시지를 정리한다.
+    ORD-2026-0708-P1: orders.db 조회를 우선 경로로 삼고(재시작 내성 확보),
+    DB에 없는 고아 메시지(마이그레이션 이전 등)를 위해 기존 채널 스캔을 fallback으로 유지."""
+    client = client or bot
+    recovered = await _startup_recovery_from_db(client)
+    recovered += await _startup_recovery_channel_scan(client)
     if recovered:
         print(f"[승인대기 복구] 부팅 시 고아 항목 {recovered}건 정리")
     return recovered
@@ -450,6 +525,7 @@ async def startup_recovery(client: discord.Client | None = None) -> int:
 @bot.event
 async def on_ready():
     print(f"[더힐즈 엔진 봇 v0.8 검색효율화] 로그인: {bot.user}")
+    orders_store.init_db()
     if not daily_briefing.is_running():
         daily_briefing.start()
         print(f"[브리핑] 매일 KST {BRIEFING_HOUR:02d}:00 자동 게시 예약됨")
@@ -475,8 +551,21 @@ async def on_message(message):
             await message.channel.send(f"✅ 브리핑을 #{BRIEFING_CHANNEL}에 게시했습니다.")
         return
 
+    # ── ORD-ID 백본 (발주서 §2): 접수 즉시 ID 발급 + orders.db 기록 + ACK 답글 ──
+    order_id = orders_store.create_order(title=message.content[:120], source_channel_msg_id=str(message.id))
+    try:
+        await message.reply(f"✅ 접수됨 (ID: {order_id})", mention_author=False)
+    except discord.HTTPException:
+        pass
+    await post_progress(message.guild, order_id, "접수", source_message=message)
+
     task_type = classify_task(message.content)
+    orders_store.update_status(order_id, "분해")
+    await post_progress(message.guild, order_id, f"분해 (유형: {task_type})", source_message=message)
     model_spec = pick_model(task_type)
+
+    orders_store.update_status(order_id, "실행중")
+    await post_progress(message.guild, order_id, "실행중", source_message=message)
 
     async with message.channel.typing():
         try:
@@ -509,23 +598,44 @@ async def on_message(message):
 
     approval_ch = discord.utils.get(message.guild.text_channels, name=APPROVAL_CHANNEL)
     if approval_ch:
+        orders_store.update_status(order_id, "CI심판")
+        await post_progress(message.guild, order_id, "CI심판", source_message=message)
         # 4-A 교차혈통 2심 (draft=answer, 원발주=message.content) — fail-open, 게이트 차단 안 함
         review = cross_review(answer, message.content, model_spec)
         reviewer_label = pick_reviewer(model_spec) or "동일 혈통"
         draft_txt = answer if len(answer) <= 1200 else answer[:1200] + "…(생략)"
         review_txt = review if len(review) <= 600 else review[:600] + "…(생략)"
+
+        orders_store.update_status(order_id, "감리")
+        await post_progress(message.guild, order_id, f"감리 (리뷰어: {reviewer_label})", source_message=message)
+
+        # #승인대기 정보 밀도 개선 (§1·§4): 파일 수·핵심 요약·PR 링크를 임베드로 구조화
+        order_row = orders_store.get_order(order_id) or {}
+        result_summary = order_row.get("result_summary") or (draft_txt.splitlines()[0][:100] if draft_txt else "—")
+        pr_url = order_row.get("pr_url") or "—"
+        embed = discord.Embed(
+            title=f"📋 승인 대기 — [{order_id}]",
+            description=draft_txt,
+            color=discord.Color.blurple(),
+        )
+        embed.add_field(name="🔍 교차 2심", value=f"({reviewer_label})\n{review_txt}"[:1024], inline=False)
+        embed.add_field(name="📁 변경 파일 수", value="—", inline=True)
+        embed.add_field(name="🔗 PR/커밋 링크", value=pr_url, inline=True)
+        embed.add_field(name="✏️ 핵심 변경 요약", value=result_summary[:1024], inline=False)
+        embed.add_field(name="↩️ 원 발주", value=f"[바로가기]({message.jump_url})", inline=False)
+
+        mention = f"<@{PRINCIPAL_MENTION_ID}>\n" if PRINCIPAL_MENTION_ID else ""
         # 일반 승인 게이트 (교차 2심 결과 병기)
-        approval_view = ApprovalView(task_name=task_type)
+        approval_view = ApprovalView(task_name=task_type, order_id=order_id)
         approval_msg = await approval_ch.send(
-            content=(
-                f"{APPROVAL_PENDING_PREFIX}\n{draft_txt}\n"
-                f"───────────────\n"
-                f"🔍 **교차 2심** ({reviewer_label})\n{review_txt}\n"
-                f"───────────────"
-            ),
+            content=f"{mention}{APPROVAL_PENDING_PREFIX}",
+            embed=embed,
             view=approval_view,
         )
         approval_view.message = approval_msg  # 워치독(on_timeout)이 편집할 대상
+        orders_store.set_approval_message(order_id, str(approval_msg.id))
+        orders_store.update_status(order_id, "승인대기")
+        await post_progress(message.guild, order_id, "승인대기", source_message=message)
 
         # 패턴 감지 → 스킬 승격 제안 (임계값 도달 + 아직 제안 안 한 유형)
         if pattern_counts[task_type] >= PROMOTE_THRESHOLD and task_type not in promoted:
