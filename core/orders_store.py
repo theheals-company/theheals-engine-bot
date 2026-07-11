@@ -29,7 +29,15 @@ CREATE TABLE IF NOT EXISTS orders (
 
 # ORD-2026-0711-P2: 하트비트 추적용 컬럼. 기존 orders.db(P1 스키마)에도 안전하게
 # 추가되도록 ALTER TABLE로 마이그레이션(컬럼 존재 시 스킵) — CREATE TABLE 재정의 불필요.
-_MIGRATIONS = (("last_heartbeat_at", "TEXT"),)
+# ORD-2026-0711-P2R: revision_count(수정 2회 누적 자동승격) + source_text/task_type
+# (재작성 시 원문·유형을 title 절삭 없이 재사용하기 위함 — "수정" 버튼이 재생성을
+# 트리거하려면 원문 전체가 필요).
+_MIGRATIONS = (
+    ("last_heartbeat_at", "TEXT"),
+    ("revision_count", "INTEGER NOT NULL DEFAULT 0"),
+    ("source_text", "TEXT"),
+    ("task_type", "TEXT"),
+)
 
 
 def _connect(db_path=None):
@@ -54,8 +62,16 @@ def _now_iso() -> str:
     return datetime.datetime.now(datetime.timezone.utc).isoformat()
 
 
-def create_order(title: str, source_channel_msg_id: str | None = None, today=None, db_path=None) -> str:
-    """ORD-YYYYMMDD-NN ID를 당일 순번으로 발급하고 orders에 접수 상태로 기록. ID 반환."""
+def create_order(
+    title: str,
+    source_channel_msg_id: str | None = None,
+    today=None,
+    db_path=None,
+    source_text: str | None = None,
+) -> str:
+    """ORD-YYYYMMDD-NN ID를 당일 순번으로 발급하고 orders에 접수 상태로 기록. ID 반환.
+    source_text: 절삭 없는 원문(발주서 §2R) — "수정" 재작성 시 title(120자 절삭)
+    대신 이걸 재사용해야 원 발주 내용이 손실되지 않는다."""
     today = today or datetime.datetime.now(datetime.timezone.utc).date()
     prefix = f"ORD-{today:%Y%m%d}-"
     conn = _connect(db_path)
@@ -64,12 +80,33 @@ def create_order(title: str, source_channel_msg_id: str | None = None, today=Non
         order_id = f"{prefix}{count + 1:02d}"
         now = _now_iso()
         conn.execute(
-            "INSERT INTO orders (id, title, status, created_at, updated_at, source_channel_msg_id) "
-            "VALUES (?, ?, ?, ?, ?, ?)",
-            (order_id, title, "접수", now, now, source_channel_msg_id),
+            "INSERT INTO orders (id, title, status, created_at, updated_at, source_channel_msg_id, source_text) "
+            "VALUES (?, ?, ?, ?, ?, ?, ?)",
+            (order_id, title, "접수", now, now, source_channel_msg_id, source_text),
         )
         conn.commit()
         return order_id
+    finally:
+        conn.close()
+
+
+def set_task_type(order_id: str, task_type: str, db_path=None) -> None:
+    conn = _connect(db_path)
+    try:
+        conn.execute("UPDATE orders SET task_type = ? WHERE id = ?", (task_type, order_id))
+        conn.commit()
+    finally:
+        conn.close()
+
+
+def increment_revision_count(order_id: str, db_path=None) -> int:
+    """'수정' 버튼 클릭마다 호출. 새 revision_count 반환(ORD-2026-0711-P2R 모듈2)."""
+    conn = _connect(db_path)
+    try:
+        conn.execute("UPDATE orders SET revision_count = revision_count + 1 WHERE id = ?", (order_id,))
+        conn.commit()
+        (count,) = conn.execute("SELECT revision_count FROM orders WHERE id = ?", (order_id,)).fetchone()
+        return count
     finally:
         conn.close()
 

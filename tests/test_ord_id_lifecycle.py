@@ -83,8 +83,23 @@ def _make_guild():
     return guild, order_ch, approval_ch, progress_ch
 
 
+def _healthy_answer(user_msg: str = "") -> str:
+    """모듈1(4섹션)·모듈3(100자 이상·키워드 echo·모델메타)을 모두 통과하는 건강한 모의 응답.
+    user_msg 일부를 그대로 echo해 발주 핵심 키워드 매칭 체크를 어떤 테스트 문구에도 통과시킨다."""
+    return (
+        f"{user_msg[:30]} 관련 실행 계획입니다.\n"
+        "모델 배정: Sonnet 기본 티어로 처리합니다.\n"
+        "산출물 및 저장 경로: docs/output.md에 저장합니다.\n"
+        "버전관리/제출 경로: PR-only 원칙에 따라 브랜치 후 PR로 제출합니다.\n"
+        "완료 및 검증 기준: 리뷰 승인 시 완료로 간주합니다."
+    )
+
+
 def _mock_call_model(monkeypatch):
-    monkeypatch.setattr(bot, "call_model", lambda *a, **k: ("모의 응답 본문", "입력 1/출력 1"))
+    def fake_call_model(model_spec, system, user_msg, max_tokens=2048):
+        return _healthy_answer(user_msg), "입력 1/출력 1"
+
+    monkeypatch.setattr(bot, "call_model", fake_call_model)
 
 
 def _run(coro):
@@ -150,7 +165,7 @@ def test_on_message_builds_result_embed_with_required_fields(monkeypatch):
     assert "✏️ 핵심 변경 요약" in field_names
     assert "↩️ 원 발주" in field_names
     summary_field = next(f for f in embed.fields if f.name == "✏️ 핵심 변경 요약")
-    assert summary_field.value == "모의 응답 본문"
+    assert summary_field.value == _healthy_answer(message.content).splitlines()[0]
     link_field = next(f for f in embed.fields if f.name == "↩️ 원 발주")
     assert message.jump_url in link_field.value
     assert sent["content"].startswith(bot.APPROVAL_PENDING_PREFIX)
@@ -220,15 +235,24 @@ def test_approve_with_order_id_transitions_to_완결_and_posts_progress():
     assert progress_ch.sent[-1]["content"].startswith(f"[{order_id}] 상태: 완결")
 
 
-def test_revise_with_order_id_transitions_to_수정요청():
-    order_id = orders_store.create_order("테스트 발주", "1")
+def test_revise_with_order_id_triggers_regeneration_and_reaches_승인대기(monkeypatch):
+    """가드(ORD-2026-0711-P2R 모듈2): '수정' 클릭은 revision_count를 올리고 자동
+    재생성을 트리거한다. 1회차(revision_count=1)는 아직 승격 대상이 아니므로
+    재생성이 정상 진행되면 다시 승인대기에 도달한다."""
+    _mock_call_model(monkeypatch)
+    order_id = orders_store.create_order("테스트 발주", "1", source_text="테스트 발주 원문")
+    orders_store.set_task_type(order_id, "일반")
     guild, order_ch, approval_ch, progress_ch = _make_guild()
     view = bot.ApprovalView(task_name="일반", order_id=order_id)
     interaction = _FakeInteraction(guild=guild)
 
     _run(type(view).revise(view, interaction, None))
 
-    assert orders_store.get_order(order_id)["status"] == "수정요청"
+    order = orders_store.get_order(order_id)
+    assert order["revision_count"] == 1
+    assert order["status"] == "승인대기"
+    assert len(approval_ch.sent) == 1
+    assert "⬆️ 자동 승격" not in [f.name for f in approval_ch.sent[0]["embed"].fields]
 
 
 def test_approve_without_order_id_does_not_touch_db_or_crash():

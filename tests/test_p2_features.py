@@ -92,6 +92,17 @@ def _order_id_from_reply(message):
     return re.match(r"✅ 접수됨 \(ID: (ORD-\d{8}-\d{2})\)", message.replies[0]).group(1)
 
 
+def _healthy_answer(user_msg: str = "") -> str:
+    """모듈1(4섹션)·모듈3(100자 이상·키워드 echo·모델메타)을 모두 통과하는 건강한 모의 응답."""
+    return (
+        f"{user_msg[:30]} 관련 실행 계획입니다.\n"
+        "모델 배정: Sonnet 기본 티어로 처리합니다.\n"
+        "산출물 및 저장 경로: docs/output.md에 저장합니다.\n"
+        "버전관리/제출 경로: PR-only 원칙에 따라 브랜치 후 PR로 제출합니다.\n"
+        "완료 및 검증 기준: 리뷰 승인 시 완료로 간주합니다."
+    )
+
+
 # ── 추론 티어링 (v0.2 §7-2) ─────────────────────────────────────────────────
 
 
@@ -129,7 +140,11 @@ def test_pick_model_research_and_review_bypass_tiering():
 
 def test_on_message_marks_escalated_answer_with_opus_notice(monkeypatch):
     """가드: 판단 필요 감지로 Opus 승격 시 응답에 명시 문구가 붙음."""
-    monkeypatch.setattr(bot, "call_model", lambda *a, **k: ("모의 응답", "입력 1/출력 1"))
+    monkeypatch.setattr(
+        bot,
+        "call_model",
+        lambda model_spec, system, user_msg, max_tokens=2048: (_healthy_answer(user_msg), "입력 1/출력 1"),
+    )
     guild, order_ch, approval_ch, progress_ch = _make_guild()
     message = _FakeOrderMessage("이 전략적 리스크에 대해 판단해줘", order_ch, guild)
 
@@ -140,7 +155,11 @@ def test_on_message_marks_escalated_answer_with_opus_notice(monkeypatch):
 
 
 def test_on_message_no_opus_notice_for_plain_message(monkeypatch):
-    monkeypatch.setattr(bot, "call_model", lambda *a, **k: ("모의 응답", "입력 1/출력 1"))
+    monkeypatch.setattr(
+        bot,
+        "call_model",
+        lambda model_spec, system, user_msg, max_tokens=2048: (_healthy_answer(user_msg), "입력 1/출력 1"),
+    )
     guild, order_ch, approval_ch, progress_ch = _make_guild()
     message = _FakeOrderMessage("안녕하세요 테스트입니다", order_ch, guild)
 
@@ -180,11 +199,11 @@ def test_on_message_escalated_retry_success_does_not_trigger_mid_report(monkeypa
     """가드: 1차 실패 후 승계 재시도가 성공하면 중간보고 없이 정상 파이프라인 계속(회귀 방지)."""
     calls = {"n": 0}
 
-    def flaky(*a, **k):
+    def flaky(model_spec, system, user_msg, max_tokens=2048):
         calls["n"] += 1
         if calls["n"] == 1:
             raise RuntimeError("first failure")
-        return "재시도 성공 응답", "입력 1/출력 1"
+        return _healthy_answer(user_msg), "입력 1/출력 1"
 
     monkeypatch.setattr(bot, "call_model", flaky)
     monkeypatch.setattr(bot, "_should_escalate", lambda task_type: True)

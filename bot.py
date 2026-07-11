@@ -9,6 +9,7 @@
 
 import datetime
 import os
+import re
 from collections import defaultdict
 from zoneinfo import ZoneInfo
 
@@ -16,7 +17,7 @@ import anthropic
 import discord
 from discord.ext import tasks
 
-from core import models_loader, orders_store
+from core import glossary_loader, models_loader, orders_store
 from vault_writer import process_cancel_note, promote_fail_pattern, record_fail_pattern
 
 DISCORD_TOKEN = os.environ["DISCORD_TOKEN"]
@@ -64,6 +65,37 @@ SYSTEM_CROSS = """너는 교차혈통 2심 리뷰어다. 빌더와 다른 회사
 • 수정제안(선택): ...
 너는 최종 판정자가 아니다. 최종 결정은 대표가 한다."""
 
+# ── 용어사전 실시간 주입 (ORD-2026-0711-P2R 모듈4, 사고 1·2 재발 방지) ──
+# IOBT 오인·models.yaml 미참조 사고 재발 방지를 위해 특히 강조하는 3개 용어.
+_GLOSSARY_EMPHASIS = """⚠️ 특히 아래 3개 용어는 위 용어사전 정의를 반드시 그대로 따를 것 — 임의 재해석 금지:
+- IOBT = Inside-Out Body Tracking (군사/전장/"Internet of Battlefield Things" 의미 절대 아님)
+- CI심판 = 1차, GitHub Actions 기반 자동검증(린트/테스트/빌드). 현재 미구현 상태(실행된 적 없는 빈 라벨)임을 인지할 것
+- 감리 = 2차, 교차모델 리뷰(cross_review, 현재 GPT-5.5). CI심판과 별개이며 병합 대상 아님"""
+
+_STATE_UNAWARE_NOTICE = """⚠️ 상태 미인지 모드: 용어사전 로드 실패로 프로젝트 고유 용어·규칙에 접근하지 못했다.
+확신에 찬 답변 대신 평소보다 보수적으로 응답하라 — 모르면 일반지식으로 추측해 채우지 말고 질문하라."""
+
+
+def build_system_prompt(base_prompt: str) -> tuple[str, bool]:
+    """반환: (system_prompt, glossary_loaded). glossary_loaded=False면 응답에
+    "⚠️ 상태 미인지 모드"를 명시해야 한다(호출부 책임)."""
+    glossary = glossary_loader.get_glossary()
+    if glossary:
+        return (
+            f"{base_prompt}\n\n[용어사전 — 아래 정의를 반드시 그대로 따를 것. 임의 해석 금지]\n"
+            f"{glossary}\n\n{_GLOSSARY_EMPHASIS}",
+            True,
+        )
+    return f"{base_prompt}\n\n{_STATE_UNAWARE_NOTICE}", False
+
+
+def _prefix_if_state_unaware(text: str, glossary_loaded: bool) -> str:
+    """glossary_loaded=False면 응답 상단에 '⚠️ 상태 미인지 모드'를 명시(모르면서 아는 척 금지)."""
+    if glossary_loaded:
+        return text
+    return f"⚠️ 상태 미인지 모드 (용어사전 로드 실패)\n\n{text}"
+
+
 # ── 세션 메모리: 작업 유형별 카운트 + 발주 기록 ──
 pattern_counts = defaultdict(int)
 pattern_examples = defaultdict(list)
@@ -97,15 +129,57 @@ def needs_judgment_tier(user_msg: str) -> bool:
     return any(k in user_msg for k in JUDGMENT_KEYWORDS)
 
 
-def pick_model(task_type: str, user_msg: str = "") -> tuple[str, bool]:
-    """반환: (model_spec, escalated). escalated=True면 판단 필요 감지로 Opus 티어 승격."""
+def pick_model(task_type: str, user_msg: str = "", force_escalate: bool = False) -> tuple[str, bool]:
+    """반환: (model_spec, escalated). escalated=True면 Opus 티어 승격.
+    force_escalate=True: 수정 2회 누적(ORD-2026-0711-P2R 모듈2) 등 외부 판단으로 강제 승격."""
     if task_type == "리서치":
         return models_loader.get_model("research"), False
     if task_type == "검증":
         return models_loader.get_model("review"), False
-    if needs_judgment_tier(user_msg):
-        return models_loader.get_model("design"), True  # Opus 티어(전략 질의·판단 조언)
+    if force_escalate or needs_judgment_tier(user_msg):
+        return models_loader.get_model("design"), True  # Opus 티어(전략 질의·판단 조언·강제승격)
     return f"claude:{models_loader.get_fallback()}", False  # Sonnet 기본 티어(일상 처리)
+
+
+# ── 발주 템플릿 고정 체크리스트 (ORD-2026-0711-P2R 모듈1, 구 항목4) ──
+# CREATE/SCALE 계획 응답에 강제할 4섹션. 헤더 문자열은 PLAN_TEMPLATE_INSTRUCTION 지시와 1:1 대응.
+PLAN_TEMPLATE_SECTIONS = ("모델 배정", "산출물 및 저장 경로", "버전관리/제출 경로", "완료 및 검증 기준")
+
+PLAN_TEMPLATE_INSTRUCTION = """[발주 템플릿 고정 체크리스트 — 필수, 누락 금지]
+CREATE/SCALE 계획 응답에는 아래 4개 섹션을 정확히 이 제목 그대로 포함하라:
+1. 모델 배정: (Step별로 models.yaml 실제 값만 인용 — 임의 모델명 기재 금지)
+2. 산출물 및 저장 경로: (파일명 포함)
+3. 버전관리/제출 경로: (PR-only 원칙 명시)
+4. 완료 및 검증 기준:"""
+
+
+def missing_template_sections(answer: str) -> list[str]:
+    """4개 필수 섹션 중 answer에 없는 것 반환(빈 리스트=통과)."""
+    return [s for s in PLAN_TEMPLATE_SECTIONS if s not in answer]
+
+
+# ── 출력 게이트 (ORD-2026-0711-P2R 모듈3, 사고3 "빈 드래프트 감리 제출" 재발 방지) ──
+def validate_output_gate(answer: str, source_text: str, title: str = "") -> list[str]:
+    """제출 직전 4종 자가검증. 실패 항목명 리스트 반환(빈 리스트=통과)."""
+    failures = []
+    if len(answer.strip()) < 100:
+        failures.append("본문 비어있음(공백 제거 후 100자 미만)")
+    keywords = [w for w in re.findall(r"\w+", source_text) if len(w) >= 2]
+    if keywords and not any(k in answer for k in keywords):
+        failures.append("발주 핵심 키워드 매칭 없음")
+    if not title.strip():
+        failures.append("제목 필드 누락")
+    if "🤖 모델" not in answer:
+        failures.append("모델 메타 필드 누락")
+    return failures
+
+
+def draft_matches_answer(draft_txt: str, answer: str) -> bool:
+    """제출 payload(draft_txt)가 실제 저장 body(answer)와 일치하는지 확인 —
+    draft_txt는 answer 전체이거나 1200자 절삭+'…(생략)' 형태여야 한다."""
+    if draft_txt == answer:
+        return True
+    return draft_txt.endswith("…(생략)") and answer.startswith(draft_txt[: -len("…(생략)")])
 
 
 def call_model(model_spec, system, user_msg, max_tokens=2048):
@@ -154,9 +228,10 @@ def cross_review(draft, user_msg, builder_spec) -> str:
         return "⚠️ 교차 2심 생략 (동일 혈통)"
     try:
         # call_model은 (텍스트, 사용량) 튜플을 반환 → 텍스트만 사용
+        system_cross, _ = build_system_prompt(SYSTEM_CROSS)  # 리뷰어도 용어사전 인지 필요(도메인 오인 판별)
         text, _ = call_model(
             reviewer,
-            SYSTEM_CROSS,
+            system_cross,
             f"[원발주]\n{user_msg}\n\n[드래프트]\n{draft}",
             max_tokens=700,
         )
@@ -362,9 +437,12 @@ class ApprovalView(discord.ui.View):
             c.style = discord.ButtonStyle.secondary
         await i.response.edit_message(content="✏️ **수정 요청됨**", view=self)
         self.stop()  # 최종 상태 도달 — 워치독 타임아웃 정지
-        if self.order_id:
-            orders_store.update_status(self.order_id, "수정요청")
-            await post_progress(i.guild, self.order_id, "수정요청")
+        if not self.order_id:
+            return
+        orders_store.update_status(self.order_id, "수정요청")
+        await post_progress(i.guild, self.order_id, "수정요청")
+        if i.guild is not None:
+            await _trigger_revision_regeneration(i.guild, self.order_id)
 
     @discord.ui.button(label="취소", style=discord.ButtonStyle.danger, emoji="❌")
     async def cancel(self, i, b):
@@ -417,7 +495,9 @@ class PromoteView(discord.ui.View):
             f"헌법 제5조 승격 절차 준수, 간결하게.\n\n발주들:\n{examples}"
         )
         try:
-            draft, _ = call_model(models_loader.get_model("design"), SYSTEM_PROMPT, draft_prompt, 1500)
+            system_prompt, glossary_loaded = build_system_prompt(SYSTEM_PROMPT)
+            draft, _ = call_model(models_loader.get_model("design"), system_prompt, draft_prompt, 1500)
+            draft = _prefix_if_state_unaware(draft, glossary_loaded)
         except Exception as e:
             draft = f"⚠️ 초안 생성 오류: {e}"
 
@@ -514,7 +594,9 @@ async def generate_briefing():
     # 2단계: Claude 심화 분석 (접목·방어·씨앗) — v0.2 §7-2: 일상 브리핑은 Sonnet 기본 티어
     try:
         analysis_prompt = ANALYSIS_PROMPT_TMPL.format(context=HEALS_CONTEXT, trends=trends[:3000])
-        analysis, _ = call_model(f"claude:{models_loader.get_fallback()}", SYSTEM_PROMPT, analysis_prompt, 2000)
+        system_prompt, glossary_loaded = build_system_prompt(SYSTEM_PROMPT)
+        analysis, _ = call_model(f"claude:{models_loader.get_fallback()}", system_prompt, analysis_prompt, 2000)
+        analysis = _prefix_if_state_unaware(analysis, glossary_loaded)
     except Exception as e:
         analysis = f"⚠️ 분석 생성 오류: {e}\n\n[검색 원문]\n{trends[:1500]}"
     return f"📢 **더힐즈 엔진 진화 브리핑 — {today}**\n_Gemini 포착 → 관제봇 해석 (접목·방어·씨앗)_\n\n{analysis}"
@@ -631,6 +713,11 @@ async def startup_recovery(client: discord.Client | None = None) -> int:
 async def on_ready():
     print(f"[더힐즈 엔진 봇 v0.8 검색효율화] 로그인: {bot.user}")
     orders_store.init_db()
+    try:
+        glossary_loader.load_glossary()
+        print("[용어사전] glossary.md 로드 완료 — LLM 호출 시스템 프롬프트에 자동 주입됩니다.")
+    except Exception as e:
+        print(f"[용어사전] 로드 실패({e}) — 상태 미인지 모드로 응답합니다.")
     if not daily_briefing.is_running():
         daily_briefing.start()
         print(f"[브리핑] 매일 KST {BRIEFING_HOUR:02d}:00 자동 게시 예약됨")
@@ -638,6 +725,239 @@ async def on_ready():
         heartbeat_check.start()
         print(f"[하트비트] {HEARTBEAT_CHECK_INTERVAL_MINUTES}분마다 실행중 발주 점검 시작")
     await startup_recovery()
+
+
+async def _generate_and_submit(
+    guild: discord.Guild,
+    order_channel,
+    order_id: str,
+    task_type: str,
+    user_text: str,
+    source_message: discord.Message | None = None,
+    *,
+    force_escalate: bool = False,
+    count_pattern: bool = True,
+) -> None:
+    """발주 1건의 생성→자가검증(모듈1·3)→감리→승인대기 제출까지 전체 파이프라인.
+    on_message(최초 생성)와 ApprovalView.revise(수정 2회 누적 재작성, ORD-2026-0711-P2R
+    모듈2)가 공유한다 — 카파시2원칙(중복 없이 단순하게)."""
+    model_spec, escalated = pick_model(task_type, user_text, force_escalate=force_escalate)
+
+    orders_store.update_status(order_id, "실행중")
+    await post_progress(guild, order_id, "실행중", source_message=source_message)
+
+    system_prompt, glossary_loaded = build_system_prompt(SYSTEM_PROMPT)
+    if task_type not in ("리서치", "검증"):
+        system_prompt = f"{system_prompt}\n\n{PLAN_TEMPLATE_INSTRUCTION}"  # 모듈1: 계획성 응답만 대상
+
+    failure_reason = None
+    async with order_channel.typing():
+        try:
+            answer, usage = call_model(model_spec, system_prompt, user_text)
+            _fail_streak[task_type] = 0
+            answer += f"\n\n— — —\n🤖 모델: {model_spec} | 📊 {usage} | 🏷️ 유형: {task_type}"
+            if escalated:
+                marker = (
+                    "⬆️ 자동 승격됨 (사유: 수정 2회 누적)" if force_escalate else "🎯 판단 필요 감지 — Opus 티어 사용"
+                )
+                answer += f"\n{marker}"
+            answer = _prefix_if_state_unaware(answer, glossary_loaded)
+        except Exception as e:
+            _fail_streak[task_type] = _fail_streak.get(task_type, 0) + 1
+            if _should_escalate(task_type):
+                # 연속 실패/특정 task_type → principal로 재라우팅 후 1회 재시도
+                model_spec = await escalate_to_principal(
+                    order_channel, task_type, f"{task_type} {_fail_streak[task_type]}회 연속 실패"
+                )
+                try:
+                    answer, usage = call_model(model_spec, system_prompt, user_text)
+                    _fail_streak[task_type] = 0
+                    answer += f"\n\n— — —\n🤖 모델(승계): {model_spec} | 📊 {usage} | 🏷️ 유형: {task_type}"
+                    answer = _prefix_if_state_unaware(answer, glossary_loaded)
+                except Exception as e2:
+                    failure_reason = f"모델 처리 실패(승계 후에도): {e2}"
+            else:
+                failure_reason = f"모델 처리 실패: {e}"
+
+    # 카파시 1원칙(모호하면 멈춰 질문): 실행중 단계에서 최종 실패하면 깨진 답을 승인
+    # 게이트로 흘려보내지 않고, #진행상황에 중간보고 질문을 올려 대표 판단을 기다린다.
+    if failure_reason is not None:
+        await order_channel.send(f"⚠️ 처리 중단 — 대표 판단 필요: {failure_reason}")
+        await post_mid_report(guild, order_id, failure_reason, source_message=source_message)
+        return
+
+    # ── 모듈1: 발주 템플릿 고정 체크리스트 — 누락 시 1회 자체 재작성(계획성 유형만) ──
+    if task_type not in ("리서치", "검증"):
+        missing = missing_template_sections(answer)
+        if missing:
+            retry_prompt = (
+                f"{user_text}\n\n[자가검증 실패 — 재작성 요청]\n"
+                f"이전 응답에 다음 필수 섹션이 누락됨. 반드시 포함해 다시 작성하라:\n"
+                + "\n".join(f"- {m}" for m in missing)
+            )
+            try:
+                answer, usage = call_model(model_spec, system_prompt, retry_prompt)
+                answer += f"\n\n— — —\n🤖 모델: {model_spec} | 📊 {usage} | 🏷️ 유형: {task_type}"
+                answer = _prefix_if_state_unaware(answer, glossary_loaded)
+            except Exception:
+                pass  # 재작성도 실패하면 원본 유지 — 모듈3 출력게이트가 최종 방어선
+
+    # ── 모듈3: 출력 게이트 — 사고3("빈 드래프트 감리 제출") 재발 방지 ──
+    order_row = orders_store.get_order(order_id) or {}
+    gate_failures = validate_output_gate(answer, user_text, title=order_row.get("title", ""))
+    if gate_failures:
+        retry_prompt = (
+            f"{user_text}\n\n[출력 검증 실패 — 재생성 요청]\n"
+            f"이전 응답이 다음 이유로 반려됨. 반드시 해결해서 다시 작성하라:\n"
+            + "\n".join(f"- {g}" for g in gate_failures)
+        )
+        try:
+            answer, usage = call_model(model_spec, system_prompt, retry_prompt)
+            answer += f"\n\n— — —\n🤖 모델: {model_spec} | 📊 {usage} | 🏷️ 유형: {task_type}"
+            answer = _prefix_if_state_unaware(answer, glossary_loaded)
+        except Exception:
+            pass
+        gate_failures = validate_output_gate(answer, user_text, title=order_row.get("title", ""))
+        if gate_failures:
+            orders_store.update_status(order_id, "출력검증실패")
+            ch = _progress_channel(guild)
+            if ch:
+                try:
+                    await ch.send(f"❌ [{order_id}] 출력 검증 실패 — 수동 확인 필요")
+                except discord.HTTPException:
+                    pass
+            return  # 빈/부실 드래프트가 감리·승인대기로 흘러가는 경로 원천 차단
+
+    for idx in range(0, len(answer), 1900):
+        await order_channel.send(answer[idx : idx + 1900])
+
+    # ── 메모리 학습: 패턴 기록·감지 (재작성 라운드는 중복 집계 방지 위해 스킵 가능) ──
+    if count_pattern and task_type != "일반":
+        pattern_counts[task_type] += 1
+        pattern_examples[task_type].append(user_text[:100])
+
+    approval_ch = discord.utils.get(guild.text_channels, name=APPROVAL_CHANNEL)
+    if approval_ch:
+        orders_store.update_status(order_id, "CI심판")
+        await post_progress(guild, order_id, "CI심판", source_message=source_message)
+        # 4-A 교차혈통 2심 (draft=answer, 원발주=user_text) — fail-open, 게이트 차단 안 함
+        review = cross_review(answer, user_text, model_spec)
+        reviewer_label = pick_reviewer(model_spec) or "동일 혈통"
+        draft_txt = answer if len(answer) <= 1200 else answer[:1200] + "…(생략)"
+        review_txt = review if len(review) <= 600 else review[:600] + "…(생략)"
+
+        # 모듈3 4번째 검증: 제출 payload(draft_txt)가 실제 저장 body(answer)와 일치하는지
+        # 최종 확인(사고3 재발 방지 최종 방어선) — 정상 경로에서는 항상 참이어야 한다.
+        if not draft_matches_answer(draft_txt, answer):
+            orders_store.update_status(order_id, "출력검증실패")
+            ch = _progress_channel(guild)
+            if ch:
+                try:
+                    await ch.send(f"❌ [{order_id}] 출력 검증 실패 — 수동 확인 필요 (payload 불일치)")
+                except discord.HTTPException:
+                    pass
+            return
+
+        orders_store.update_status(order_id, "감리")
+        await post_progress(guild, order_id, f"감리 (리뷰어: {reviewer_label})", source_message=source_message)
+
+        # #승인대기 정보 밀도 개선 (§1·§4): 파일 수·핵심 요약·PR 링크를 임베드로 구조화
+        order_row = orders_store.get_order(order_id) or {}
+        result_summary = order_row.get("result_summary") or (draft_txt.splitlines()[0][:100] if draft_txt else "—")
+        pr_url = order_row.get("pr_url") or "—"
+        embed = discord.Embed(
+            title=f"📋 승인 대기 — [{order_id}]",
+            description=draft_txt,
+            color=discord.Color.blurple(),
+        )
+        embed.add_field(name="🔍 교차 2심", value=f"({reviewer_label})\n{review_txt}"[:1024], inline=False)
+        embed.add_field(name="📁 변경 파일 수", value="—", inline=True)
+        embed.add_field(name="🔗 PR/커밋 링크", value=pr_url, inline=True)
+        embed.add_field(name="✏️ 핵심 변경 요약", value=result_summary[:1024], inline=False)
+        if force_escalate:
+            # 증보 조항2(ORD-2026-0711-P2R 모듈2): 수정 2회 누적 자동 승격 표기
+            embed.add_field(name="⬆️ 자동 승격", value="자동 승격됨 (사유: 수정 2회 누적)", inline=False)
+        if source_message is not None:
+            embed.add_field(name="↩️ 원 발주", value=f"[바로가기]({source_message.jump_url})", inline=False)
+
+        mention = f"<@{PRINCIPAL_MENTION_ID}>\n" if PRINCIPAL_MENTION_ID else ""
+        # 일반 승인 게이트 (교차 2심 결과 병기)
+        approval_view = ApprovalView(task_name=task_type, order_id=order_id)
+        approval_msg = await approval_ch.send(
+            content=f"{mention}{APPROVAL_PENDING_PREFIX}",
+            embed=embed,
+            view=approval_view,
+        )
+        approval_view.message = approval_msg  # 워치독(on_timeout)이 편집할 대상
+        orders_store.set_approval_message(order_id, str(approval_msg.id))
+        orders_store.update_status(order_id, "승인대기")
+        await post_progress(guild, order_id, "승인대기", source_message=source_message)
+
+        # 패턴 감지 → 스킬 승격 제안 (임계값 도달 + 아직 제안 안 한 유형)
+        if count_pattern and pattern_counts[task_type] >= PROMOTE_THRESHOLD and task_type not in promoted:
+            promoted.add(task_type)
+            # 판단 근거: 반복된 실제 작업 목록
+            recent = pattern_examples[task_type][-PROMOTE_THRESHOLD:]
+            examples_txt = "\n".join(f"   {n}. {e}" for n, e in enumerate(recent, 1))
+            # 관제봇의 분석: 이 패턴이 스킬로 만들 가치가 있는지 봇이 판단
+            analyze_prompt = (
+                f"'{task_type}' 유형 작업이 {pattern_counts[task_type]}회 반복됐다. "
+                f"아래 실제 발주들을 분석해, 재사용 스킬로 승격할 가치가 있는지 판단하라.\n\n"
+                f"발주들:\n{examples_txt}\n\n"
+                f"다음 형식으로 4줄 이내로만 답하라(군더더기 금지):\n"
+                f"공통점: (세 작업의 공통 패턴 한 줄)\n"
+                f"스킬가치: 높음/중간/낮음 (한 줄 근거)\n"
+                f"추천: ✅승격 권장 또는 ❌보류 권장 (한 줄 이유)"
+            )
+            try:
+                skill_system_prompt, skill_glossary_loaded = build_system_prompt(SYSTEM_PROMPT)
+                analysis, _ = call_model(models_loader.get_model("design"), skill_system_prompt, analyze_prompt, 500)
+                analysis = _prefix_if_state_unaware(analysis, skill_glossary_loaded)
+            except Exception as e:
+                analysis = f"(분석 생성 오류: {e})"
+            await approval_ch.send(
+                content=(
+                    f"🧠 **메모리 학습 — 패턴 감지**\n"
+                    f"'{task_type}' 유형 작업이 **{pattern_counts[task_type]}회** 반복되었습니다.\n\n"
+                    f"📊 **반복된 작업들:**\n{examples_txt}\n\n"
+                    f"🔍 **관제봇의 분석:**\n{analysis}\n\n"
+                    f"🛡️ 승인하셔도 자동 저장이 아니라 **초안만 생성**됩니다 "
+                    f"(검토 후 직접 20_SKILLS에 저장 — 맥락 오염 차단)\n\n"
+                    f"→ 위 분석을 참고해 결정하세요."
+                ),
+                view=PromoteView(task_type),
+            )
+
+
+async def _trigger_revision_regeneration(guild: discord.Guild, order_id: str) -> None:
+    """ORD-2026-0711-P2R 모듈2: '수정' 버튼 클릭마다 revision_count 증가, 2회
+    누적되면 다음 재작성부터 상위 티어로 자동 승격해서 재생성한다."""
+    revision_count = orders_store.increment_revision_count(order_id)
+    order = orders_store.get_order(order_id)
+    if order is None:
+        return
+    user_text = order.get("source_text") or order.get("title") or ""
+    task_type = order.get("task_type") or "일반"
+    order_ch = discord.utils.get(guild.text_channels, name=ORDER_CHANNEL)
+    if order_ch is None:
+        return
+    source_message = None
+    src_id = order.get("source_channel_msg_id")
+    if src_id:
+        try:
+            source_message = await order_ch.fetch_message(int(src_id))
+        except (discord.HTTPException, ValueError, AttributeError):
+            source_message = None
+    await _generate_and_submit(
+        guild,
+        order_ch,
+        order_id,
+        task_type,
+        user_text,
+        source_message,
+        force_escalate=revision_count >= 2,
+        count_pattern=False,
+    )
 
 
 @bot.event
@@ -660,7 +980,9 @@ async def on_message(message):
         return
 
     # ── ORD-ID 백본 (발주서 §2): 접수 즉시 ID 발급 + orders.db 기록 + ACK 답글 ──
-    order_id = orders_store.create_order(title=message.content[:120], source_channel_msg_id=str(message.id))
+    order_id = orders_store.create_order(
+        title=message.content[:120], source_channel_msg_id=str(message.id), source_text=message.content
+    )
     try:
         await message.reply(f"✅ 접수됨 (ID: {order_id})", mention_author=False)
     except discord.HTTPException:
@@ -668,125 +990,11 @@ async def on_message(message):
     await post_progress(message.guild, order_id, "접수", source_message=message)
 
     task_type = classify_task(message.content)
+    orders_store.set_task_type(order_id, task_type)
     orders_store.update_status(order_id, "분해")
     await post_progress(message.guild, order_id, f"분해 (유형: {task_type})", source_message=message)
-    model_spec, escalated = pick_model(task_type, message.content)
 
-    orders_store.update_status(order_id, "실행중")
-    await post_progress(message.guild, order_id, "실행중", source_message=message)
-
-    failure_reason = None
-    async with message.channel.typing():
-        try:
-            answer, usage = call_model(model_spec, SYSTEM_PROMPT, message.content)
-            _fail_streak[task_type] = 0
-            answer += f"\n\n— — —\n🤖 모델: {model_spec} | 📊 {usage} | 🏷️ 유형: {task_type}"
-            if escalated:
-                answer += "\n🎯 판단 필요 감지 — Opus 티어 사용"
-        except Exception as e:
-            _fail_streak[task_type] = _fail_streak.get(task_type, 0) + 1
-            if _should_escalate(task_type):
-                # 연속 실패/특정 task_type → principal로 재라우팅 후 1회 재시도
-                model_spec = await escalate_to_principal(
-                    message.channel, task_type, f"{task_type} {_fail_streak[task_type]}회 연속 실패"
-                )
-                try:
-                    answer, usage = call_model(model_spec, SYSTEM_PROMPT, message.content)
-                    _fail_streak[task_type] = 0
-                    answer += f"\n\n— — —\n🤖 모델(승계): {model_spec} | 📊 {usage} | 🏷️ 유형: {task_type}"
-                except Exception as e2:
-                    failure_reason = f"모델 처리 실패(승계 후에도): {e2}"
-            else:
-                failure_reason = f"모델 처리 실패: {e}"
-
-    # 카파시 1원칙(모호하면 멈춰 질문): 실행중 단계에서 최종 실패하면 깨진 답을 승인
-    # 게이트로 흘려보내지 않고, #진행상황에 중간보고 질문을 올려 대표 판단을 기다린다.
-    if failure_reason is not None:
-        await message.channel.send(f"⚠️ 처리 중단 — 대표 판단 필요: {failure_reason}")
-        await post_mid_report(message.guild, order_id, failure_reason, source_message=message)
-        return
-
-    for idx in range(0, len(answer), 1900):
-        await message.channel.send(answer[idx : idx + 1900])
-
-    # ── 메모리 학습: 패턴 기록·감지 ──
-    if task_type != "일반":
-        pattern_counts[task_type] += 1
-        pattern_examples[task_type].append(message.content[:100])
-
-    approval_ch = discord.utils.get(message.guild.text_channels, name=APPROVAL_CHANNEL)
-    if approval_ch:
-        orders_store.update_status(order_id, "CI심판")
-        await post_progress(message.guild, order_id, "CI심판", source_message=message)
-        # 4-A 교차혈통 2심 (draft=answer, 원발주=message.content) — fail-open, 게이트 차단 안 함
-        review = cross_review(answer, message.content, model_spec)
-        reviewer_label = pick_reviewer(model_spec) or "동일 혈통"
-        draft_txt = answer if len(answer) <= 1200 else answer[:1200] + "…(생략)"
-        review_txt = review if len(review) <= 600 else review[:600] + "…(생략)"
-
-        orders_store.update_status(order_id, "감리")
-        await post_progress(message.guild, order_id, f"감리 (리뷰어: {reviewer_label})", source_message=message)
-
-        # #승인대기 정보 밀도 개선 (§1·§4): 파일 수·핵심 요약·PR 링크를 임베드로 구조화
-        order_row = orders_store.get_order(order_id) or {}
-        result_summary = order_row.get("result_summary") or (draft_txt.splitlines()[0][:100] if draft_txt else "—")
-        pr_url = order_row.get("pr_url") or "—"
-        embed = discord.Embed(
-            title=f"📋 승인 대기 — [{order_id}]",
-            description=draft_txt,
-            color=discord.Color.blurple(),
-        )
-        embed.add_field(name="🔍 교차 2심", value=f"({reviewer_label})\n{review_txt}"[:1024], inline=False)
-        embed.add_field(name="📁 변경 파일 수", value="—", inline=True)
-        embed.add_field(name="🔗 PR/커밋 링크", value=pr_url, inline=True)
-        embed.add_field(name="✏️ 핵심 변경 요약", value=result_summary[:1024], inline=False)
-        embed.add_field(name="↩️ 원 발주", value=f"[바로가기]({message.jump_url})", inline=False)
-
-        mention = f"<@{PRINCIPAL_MENTION_ID}>\n" if PRINCIPAL_MENTION_ID else ""
-        # 일반 승인 게이트 (교차 2심 결과 병기)
-        approval_view = ApprovalView(task_name=task_type, order_id=order_id)
-        approval_msg = await approval_ch.send(
-            content=f"{mention}{APPROVAL_PENDING_PREFIX}",
-            embed=embed,
-            view=approval_view,
-        )
-        approval_view.message = approval_msg  # 워치독(on_timeout)이 편집할 대상
-        orders_store.set_approval_message(order_id, str(approval_msg.id))
-        orders_store.update_status(order_id, "승인대기")
-        await post_progress(message.guild, order_id, "승인대기", source_message=message)
-
-        # 패턴 감지 → 스킬 승격 제안 (임계값 도달 + 아직 제안 안 한 유형)
-        if pattern_counts[task_type] >= PROMOTE_THRESHOLD and task_type not in promoted:
-            promoted.add(task_type)
-            # 판단 근거: 반복된 실제 작업 목록
-            recent = pattern_examples[task_type][-PROMOTE_THRESHOLD:]
-            examples_txt = "\n".join(f"   {n}. {e}" for n, e in enumerate(recent, 1))
-            # 관제봇의 분석: 이 패턴이 스킬로 만들 가치가 있는지 봇이 판단
-            analyze_prompt = (
-                f"'{task_type}' 유형 작업이 {pattern_counts[task_type]}회 반복됐다. "
-                f"아래 실제 발주들을 분석해, 재사용 스킬로 승격할 가치가 있는지 판단하라.\n\n"
-                f"발주들:\n{examples_txt}\n\n"
-                f"다음 형식으로 4줄 이내로만 답하라(군더더기 금지):\n"
-                f"공통점: (세 작업의 공통 패턴 한 줄)\n"
-                f"스킬가치: 높음/중간/낮음 (한 줄 근거)\n"
-                f"추천: ✅승격 권장 또는 ❌보류 권장 (한 줄 이유)"
-            )
-            try:
-                analysis, _ = call_model(models_loader.get_model("design"), SYSTEM_PROMPT, analyze_prompt, 500)
-            except Exception as e:
-                analysis = f"(분석 생성 오류: {e})"
-            await approval_ch.send(
-                content=(
-                    f"🧠 **메모리 학습 — 패턴 감지**\n"
-                    f"'{task_type}' 유형 작업이 **{pattern_counts[task_type]}회** 반복되었습니다.\n\n"
-                    f"📊 **반복된 작업들:**\n{examples_txt}\n\n"
-                    f"🔍 **관제봇의 분석:**\n{analysis}\n\n"
-                    f"🛡️ 승인하셔도 자동 저장이 아니라 **초안만 생성**됩니다 "
-                    f"(검토 후 직접 20_SKILLS에 저장 — 맥락 오염 차단)\n\n"
-                    f"→ 위 분석을 참고해 결정하세요."
-                ),
-                view=PromoteView(task_type),
-            )
+    await _generate_and_submit(message.guild, message.channel, order_id, task_type, message.content, message)
 
 
 bot.run(DISCORD_TOKEN)
