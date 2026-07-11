@@ -126,3 +126,66 @@ def test_init_db_is_idempotent(tmp_path):
     orders_store.init_db(db_path)
     order_id = orders_store.create_order("발주", "1", today=datetime.date(2026, 7, 9), db_path=db_path)
     assert orders_store.get_order(order_id, db_path=db_path) is not None
+
+
+def _age_order(order_id, seconds_ago, field="updated_at"):
+    old_time = (datetime.datetime.now(datetime.timezone.utc) - datetime.timedelta(seconds=seconds_ago)).isoformat()
+    conn = orders_store._connect()
+    conn.execute(f"UPDATE orders SET {field} = ? WHERE id = ?", (old_time, order_id))
+    conn.commit()
+    conn.close()
+
+
+# ── ORD-2026-0711-P2 §2: 장기작업 하트비트 ──────────────────────────────────
+
+
+def test_list_orders_needing_heartbeat_requires_threshold_elapsed():
+    """가드: '실행중' 진입(updated_at) 후 threshold_seconds가 안 지났으면 대상 아님."""
+    order_id = orders_store.create_order("발주", "1", today=datetime.date(2026, 7, 9))
+    orders_store.update_status(order_id, "실행중")
+
+    due = orders_store.list_orders_needing_heartbeat("실행중", threshold_seconds=1800)
+    assert due == []
+
+
+def test_list_orders_needing_heartbeat_fires_after_threshold():
+    """가드: '실행중' 진입 후 threshold_seconds 이상 지나면 대상에 포함."""
+    order_id = orders_store.create_order("발주", "1", today=datetime.date(2026, 7, 9))
+    orders_store.update_status(order_id, "실행중")
+    _age_order(order_id, seconds_ago=1900)
+
+    due_ids = {o["id"] for o in orders_store.list_orders_needing_heartbeat("실행중", threshold_seconds=1800)}
+    assert order_id in due_ids
+
+
+def test_list_orders_needing_heartbeat_ignores_other_statuses():
+    """가드: '실행중'이 아닌 다른 상태(예: 승인대기)는 하트비트 대상이 아님."""
+    order_id = orders_store.create_order("발주", "1", today=datetime.date(2026, 7, 9))
+    orders_store.update_status(order_id, "승인대기")
+    _age_order(order_id, seconds_ago=1900)
+
+    due = orders_store.list_orders_needing_heartbeat("실행중", threshold_seconds=1800)
+    assert due == []
+
+
+def test_list_orders_needing_heartbeat_suppresses_repeat_within_interval():
+    """가드: 최근에 이미 하트비트를 보냈으면 같은 주기 내에는 다시 대상이 되지 않음."""
+    order_id = orders_store.create_order("발주", "1", today=datetime.date(2026, 7, 9))
+    orders_store.update_status(order_id, "실행중")
+    _age_order(order_id, seconds_ago=1900)
+    orders_store.mark_heartbeat(order_id)
+
+    due = orders_store.list_orders_needing_heartbeat("실행중", threshold_seconds=1800)
+    assert due == []
+
+
+def test_list_orders_needing_heartbeat_fires_again_after_next_interval():
+    """가드: 마지막 하트비트 이후 다시 threshold_seconds가 지나면 재발화(30,60,90분 반복 신호)."""
+    order_id = orders_store.create_order("발주", "1", today=datetime.date(2026, 7, 9))
+    orders_store.update_status(order_id, "실행중")
+    _age_order(order_id, seconds_ago=3700)
+    orders_store.mark_heartbeat(order_id)
+    _age_order(order_id, seconds_ago=1900, field="last_heartbeat_at")
+
+    due_ids = {o["id"] for o in orders_store.list_orders_needing_heartbeat("실행중", threshold_seconds=1800)}
+    assert order_id in due_ids
