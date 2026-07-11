@@ -27,6 +27,10 @@ CREATE TABLE IF NOT EXISTS orders (
 )
 """
 
+# ORD-2026-0711-P2: 하트비트 추적용 컬럼. 기존 orders.db(P1 스키마)에도 안전하게
+# 추가되도록 ALTER TABLE로 마이그레이션(컬럼 존재 시 스킵) — CREATE TABLE 재정의 불필요.
+_MIGRATIONS = (("last_heartbeat_at", "TEXT"),)
+
 
 def _connect(db_path=None):
     """모든 호출부가 테이블 존재를 가정할 수 있도록 연결 시마다 스키마를 보장한다
@@ -34,6 +38,10 @@ def _connect(db_path=None):
     conn = sqlite3.connect(db_path or DB_PATH)
     conn.row_factory = sqlite3.Row
     conn.execute(_SCHEMA)
+    existing_cols = {row["name"] for row in conn.execute("PRAGMA table_info(orders)")}
+    for col_name, col_type in _MIGRATIONS:
+        if col_name not in existing_cols:
+            conn.execute(f"ALTER TABLE orders ADD COLUMN {col_name} {col_type}")
     return conn
 
 
@@ -135,3 +143,40 @@ def list_stale_open_orders(timeout_seconds: int, db_path=None) -> list[dict]:
         if updated_at < cutoff:
             stale.append(order)
     return stale
+
+
+def list_orders_needing_heartbeat(status: str, threshold_seconds: int, db_path=None) -> list[dict]:
+    """ORD-2026-0711-P2: status로 진입(updated_at)한 지 threshold_seconds 이상 지났고,
+    아직 하트비트가 없거나 마지막 하트비트 이후 다시 threshold_seconds 이상 지난 발주.
+    장기작업 하트비트(§4-2) — 봇이 죽었는지 일하는 중인지 구분하기 위한 주기적 신호."""
+    now = datetime.datetime.now(datetime.timezone.utc)
+    cutoff = now - datetime.timedelta(seconds=threshold_seconds)
+    due = []
+    conn = _connect(db_path)
+    try:
+        rows = conn.execute("SELECT * FROM orders WHERE status = ?", (status,)).fetchall()
+    finally:
+        conn.close()
+    for row in rows:
+        order = dict(row)
+        entered_at = datetime.datetime.fromisoformat(order["updated_at"])
+        if entered_at >= cutoff:
+            continue  # 아직 임계치 전
+        last_heartbeat = order.get("last_heartbeat_at")
+        if last_heartbeat is not None and datetime.datetime.fromisoformat(last_heartbeat) >= cutoff:
+            continue  # 최근에 이미 하트비트를 보냄 — 다음 주기까지 대기
+        due.append(order)
+    return due
+
+
+def mark_heartbeat(order_id: str, db_path=None) -> None:
+    """하트비트 게시 시각 기록. updated_at은 상태 전이 전용이므로 건드리지 않는다."""
+    conn = _connect(db_path)
+    try:
+        conn.execute(
+            "UPDATE orders SET last_heartbeat_at = ? WHERE id = ?",
+            (_now_iso(), order_id),
+        )
+        conn.commit()
+    finally:
+        conn.close()
