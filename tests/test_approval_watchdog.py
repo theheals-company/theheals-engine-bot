@@ -181,6 +181,39 @@ def test_cancel_modal_stops_watchdog_on_submit(monkeypatch):
     _run(scenario())
 
 
+def test_cancel_modal_defers_before_slow_network_call(monkeypatch):
+    """가드: on_submit 첫 줄이 defer() — process_cancel_note()의 GitHub API 블로킹
+    호출보다 먼저 인터랙션에 응답해야 3초 시한 내 "This interaction failed"를 피한다."""
+    monkeypatch.setenv("GITHUB_TOKEN", "dummy-not-real")
+    monkeypatch.setenv("VAULT_REPO", "owner/repo")
+    call_order = []
+
+    def slow_save(path, content, message):
+        call_order.append("save_skill_to_vault")
+        return {"ok": True, "path": path, "url": "https://example.test"}
+
+    monkeypatch.setattr(vault_writer, "save_skill_to_vault", slow_save)
+
+    async def scenario():
+        approval_view = bot.ApprovalView(task_name="테스트")
+        modal = bot.CancelModal(task_name="테스트", view=approval_view)
+        fake_message = _FakeMessage(content=bot.APPROVAL_PENDING_PREFIX)
+        interaction = _FakeInteraction(guild=None, message=fake_message)
+
+        class _TrackedResponse(type(interaction.response)):
+            async def defer(self):
+                call_order.append("defer")
+                await super().defer()
+
+        interaction.response.__class__ = _TrackedResponse
+
+        await modal.on_submit(interaction)
+
+        assert call_order == ["defer", "save_skill_to_vault"], "defer()가 네트워크 호출보다 먼저 실행되어야 함"
+
+    _run(scenario())
+
+
 # ── 부팅 시 복구 루틴: startup_recovery ──────────────────────────────────────
 
 
