@@ -369,12 +369,15 @@ class CancelModal(discord.ui.Modal, title="취소 사유 입력"):
         self.approval_view = view
 
     async def on_submit(self, interaction: discord.Interaction):
+        # (b) 인터랙션 첫 응답은 반드시 첫 줄에서: process_cancel_note()가 내부적으로
+        # GitHub API 블로킹 호출(save_skill_to_vault)을 하므로, defer()보다 먼저 실행되면
+        # 3초 응답 시한을 넘겨 "This interaction failed"가 뜰 수 있었다(수정 전 버그).
+        await interaction.response.defer()
         fix_normalized = self.fix_input.value.strip() or "(취소 사유 미입력)"
         content, path, note_msg = process_cancel_note(self.task_name, self.cause_input.value, self.fix_input.value)
         for c in self.approval_view.children:
             c.disabled = True
             c.style = discord.ButtonStyle.secondary
-        await interaction.response.defer()
         await interaction.message.edit(
             content=f"❌ **취소됨**\n{note_msg}",
             view=self.approval_view,
